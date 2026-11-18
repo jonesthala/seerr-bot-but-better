@@ -63,6 +63,13 @@ def _id_set(name: str) -> frozenset[int]:
         raise ConfigError(f"{name} must be a comma-separated list of numbers") from exc
 
 
+def _url(name: str) -> str:
+    value = _text(name).rstrip("/")
+    if value and not value.startswith(("http://", "https://")):
+        raise ConfigError(f"{name} must start with http:// or https://")
+    return value
+
+
 def _names(name: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in _text(name).split(",") if part.strip())
 
@@ -104,6 +111,18 @@ class Settings:
     movie_profiles: tuple[str, ...] = ()
     tv_profiles: tuple[str, ...] = ()
     jellyfin_url: str = ""
+    # /jellyfin-zugang: accounts for friends (all four needed, plus admins to approve)
+    jellyfin_api_url: str = ""  # where the bot reaches Jellyfin
+    jellyfin_api_key: str = ""
+    jellyfin_friend_url: str = ""  # the address friends type into the Jellyfin app
+    tailscale_share_url: str = ""  # multi-use share invite for the Jellyfin machine
+    friend_libraries: tuple[str, ...] = ()
+    friend_bitrate_mbit: int = 4
+
+    @property
+    def friends_enabled(self) -> bool:
+        return self.has_admins and all((self.jellyfin_api_url, self.jellyfin_api_key, self.jellyfin_friend_url,
+                                        self.tailscale_share_url))
 
     def watch_url(self, url: str | None) -> str | None:
         """Seerr's link to a title in Jellyfin, with JELLYFIN_URL as its address if that is set."""
@@ -152,6 +171,14 @@ class Settings:
         limit, limit_days = _int("REQUEST_LIMIT", 0), _int("REQUEST_LIMIT_DAYS", 7)
         if limit < 0 or limit_days < 1:
             raise ConfigError("REQUEST_LIMIT must be 0 or more and REQUEST_LIMIT_DAYS at least 1")
+        api_url = _url("JELLYFIN_API_URL")
+        friend_url = _url("JELLYFIN_FRIEND_URL")
+        share_url = _text("TAILSCALE_SHARE_URL")
+        if share_url and not share_url.startswith("https://"):
+            raise ConfigError("TAILSCALE_SHARE_URL must be the invite link, starting with https://")
+        bitrate = _int("JELLYFIN_FRIEND_BITRATE_MBIT", 4)
+        if bitrate < 0:
+            raise ConfigError("JELLYFIN_FRIEND_BITRATE_MBIT must be 0 (no limit) or more")
         return cls(
             discord_token=_token(),
             guild_id=_int("DISCORD_GUILD_ID"),
@@ -174,6 +201,12 @@ class Settings:
             movie_profiles=_names("MOVIE_PROFILES"),
             tv_profiles=_names("TV_PROFILES"),
             jellyfin_url=jellyfin,
+            jellyfin_api_url=api_url,
+            jellyfin_api_key=_text("JELLYFIN_API_KEY"),
+            jellyfin_friend_url=friend_url,
+            tailscale_share_url=share_url,
+            friend_libraries=_names("JELLYFIN_FRIEND_LIBRARIES"),
+            friend_bitrate_mbit=bitrate,
         )
 
     def page_url(self, kind: str, tmdb_id: int) -> str | None:

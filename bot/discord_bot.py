@@ -43,8 +43,9 @@ from .core import (
     shorten,
     size_text,
 )
+from .jellyfin import TAILSCALE_ADMIN, JellyfinClient, JellyfinError, check_name, suggest_name, welcome_text
 from .seerr import SeerrClient
-from .store import Approval, Store
+from .store import FRIEND_APPROVED, FRIEND_DECLINED, FRIEND_PENDING, FRIEND_REVOKED, Approval, Friend, Store
 
 log = logging.getLogger("seerrbot.discord")
 
@@ -58,6 +59,8 @@ NO_ROLE = "🔒 Anfragen dürfen nur Leute mit der Rolle für Film- und Serienw�
 NO_ADMIN = "🔒 Löschen dürfen nur Admins."
 NO_DELETING = "🔒 Löschen ist nicht eingerichtet: Es fehlen `DISCORD_ADMIN_USER_IDS` oder `DISCORD_ADMIN_ROLE_ID`."
 NO_APPROVE = "🔒 Freigeben und Ablehnen dürfen nur Admins."
+NO_FRIEND_ADMIN = "🔒 Das dürfen nur Admins."
+NOT_YOURS = "🔒 Dieser Knopf ist nicht für dich."
 
 # A title picked from the autocomplete list arrives as "movie:45745"
 _PICKED = re.compile(r"^(movie|tv):(\d{1,9})$")
@@ -110,7 +113,7 @@ async def report_error(interaction: discord.Interaction, error: BaseException) -
         message = str(error)
     elif isinstance(error, app_commands.CheckFailure):
         message = "🔒 Das darfst du hier nicht."
-    elif isinstance(error, SeerrError):
+    elif isinstance(error, (SeerrError, JellyfinError)):
         message = f"⚠️ {error}"
     else:
         log.error("Interaction failed", exc_info=error)
@@ -142,7 +145,8 @@ class GuardedTree(app_commands.CommandTree):
 
 
 class SeerrBot(discord.Client):
-    def __init__(self, settings: Settings, seerr: SeerrClient, store: Store | None = None) -> None:
+    def __init__(self, settings: Settings, seerr: SeerrClient, store: Store | None = None,
+                 jellyfin: JellyfinClient | None = None) -> None:
         intents = discord.Intents.none()
         intents.guilds = True
         # Only the requester may be pinged, never @everyone or roles (titles come from TMDB).
@@ -150,11 +154,14 @@ class SeerrBot(discord.Client):
         super().__init__(intents=intents, allowed_mentions=mentions)
         self.settings = settings
         self.seerr = seerr
+        self.jellyfin = jellyfin  # None: /jellyfin-zugang is not set up
         self.store = store if store is not None else Store(settings.data_dir or None)
         self.tree = GuardedTree(self)
         self.space = SpaceWatch(settings.min_free_gb * GB)
         self.profiles: dict[str, list[tuple[int, str]]] = {"movie": [], "tv": []}
         self._approval_lock = asyncio.Lock()
+        self._friend_lock = asyncio.Lock()
+        self.login_clicks: dict[int, float] = {}  # Discord user → when the last password was made
         self._background: set[asyncio.Task] = set()
 
     async def setup_hook(self) -> None:
@@ -162,7 +169,7 @@ class SeerrBot(discord.Client):
         for command in build_commands(self):
             self.tree.add_command(command, guild=guild)
         await self.tree.sync(guild=guild)
-        self.add_dynamic_items(ApprovalButton)  # buttons keep working after a restart
+        self.add_dynamic_items(ApprovalButton, FriendButton, LoginButton)  # buttons keep working after a restart
         await self.load_profiles()
         self.space_loop.start()
         self.watch_loop.start()
@@ -183,6 +190,16 @@ class SeerrBot(discord.Client):
         if embed is not None:
             kwargs["embed"] = embed
         return await channel.send(text, **kwargs)  # type: ignore[union-attr]
+
+    async def tell(self, user_id: int, text: str, view: discord.ui.View | None = None) -> None:
+        """A direct message; if the person doesn't take DMs, in the channel with a mention."""
+        try:
+            user = self.get_user(user_id) or await self.fetch_user(user_id)
+            await user.send(text, view=view) if view is not None else await user.send(text)
+            return
+        except discord.HTTPException:
+            log.info("No DM possible to %s, using the channel", user_id)
+        await self.post(f"<@{user_id}> {text}", view=view)
 
     def in_background(self, coroutine) -> None:
         async def run() -> None:
@@ -396,6 +413,172 @@ async def handle_approval(interaction: discord.Interaction, request_id: int, act
     if action == "decline" and tracked is not None and not tracked.notified:
         await bot.post(declined_text(f"<@{tracked.user_id}>", escape(tracked.label)))
         bot.store.mark_notified(request_id)
+
+
+# --- Jellyfin accounts for friends (/jellyfin-zugang) -------------------------------------------
+LOGIN_COOLDOWN = 20  # seconds between two new passwords, so a double click doesn't void the first
+DECLINED_WAIT_DAYS = 7  # after a "no", asking again only after this long
+
+
+def friend_card_text(friend: Friend) -> str:
+    again = " Das Konto gab es schon, es wird wieder geöffnet." if friend.jellyfin_id else ""
+    return (f"🔑 **{escape(friend.user_name)}** möchte Zugang zu Jellyfin als "
+            f"**{escape(friend.jellyfin_name)}**.{again}")
+
+
+def approved_text(name: str) -> str:
+    return (f"🎉 Dein Zugang zu Jellyfin ist freigegeben, Benutzer **{escape(name)}**. Klick auf "
+            "«Zugangsdaten anzeigen»: Du bekommst die Anleitung und ein Passwort, das nur du siehst.")
+
+
+class FriendButton(discord.ui.DynamicItem[discord.ui.Button], template=r"jf:(?P<action>approve|decline):(?P<id>[0-9]+)"):
+    def __init__(self, user_id: int, action: str) -> None:
+        approve = action == "approve"
+        super().__init__(discord.ui.Button(
+            label="Freigeben" if approve else "Ablehnen",
+            emoji="✅" if approve else "✖️",
+            style=discord.ButtonStyle.success if approve else discord.ButtonStyle.danger,
+            custom_id=f"jf:{action}:{user_id}",
+        ))
+        self.user_id = user_id
+        self.action = action
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match[str]):
+        return cls(int(match["id"]), match["action"])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await handle_friend_decision(interaction, self.user_id, self.action)
+        except Exception as error:  # noqa: BLE001 - shown to the admin, details in the log
+            await report_error(interaction, error)
+
+
+def friend_view(user_id: int) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(FriendButton(user_id, "approve"))
+    view.add_item(FriendButton(user_id, "decline"))
+    return view
+
+
+class LoginButton(discord.ui.DynamicItem[discord.ui.Button], template=r"jf:login:(?P<id>[0-9]+)"):
+    def __init__(self, user_id: int) -> None:
+        super().__init__(discord.ui.Button(label="Zugangsdaten anzeigen", emoji="🔑",
+                                           style=discord.ButtonStyle.primary, custom_id=f"jf:login:{user_id}"))
+        self.user_id = user_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match[str]):
+        return cls(int(match["id"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await show_login(interaction, self.user_id)
+        except Exception as error:  # noqa: BLE001 - shown to the friend, details in the log
+            await report_error(interaction, error)
+
+
+def login_view(user_id: int) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(LoginButton(user_id))
+    return view
+
+
+async def handle_friend_decision(interaction: discord.Interaction, user_id: int, action: str) -> None:
+    bot: SeerrBot = interaction.client  # type: ignore[assignment]
+    if not bot.is_admin(interaction):
+        await interaction.response.send_message(NO_APPROVE, ephemeral=True)
+        return
+    if bot.jellyfin is None:
+        raise JellyfinError("Jellyfin-Zugänge sind nicht eingerichtet.")
+    await interaction.response.defer()
+    async with bot._friend_lock:
+        friend = bot.store.friend(user_id)
+        if friend is None or friend.state != FRIEND_PENDING:
+            text = interaction.message.content if interaction.message else ""
+            await interaction.edit_original_response(content=f"{text}\nℹ️ Schon erledigt.", view=None)
+            return
+        who = escape(interaction.user.display_name)
+        if action == "approve":
+            if friend.jellyfin_id:
+                await asyncio.to_thread(bot.jellyfin.set_access, friend.jellyfin_id, True)
+            else:
+                friend.jellyfin_id = await asyncio.to_thread(bot.jellyfin.create_friend, friend.jellyfin_name)
+            friend.state, note = FRIEND_APPROVED, f"✅ Freigegeben von {who}."
+        else:
+            friend.state, note = FRIEND_DECLINED, f"❌ Abgelehnt von {who}."
+        friend.decided = time.time()
+        bot.store.save_friend(friend)
+    await interaction.edit_original_response(content=f"{friend.card_text}\n{note}", view=None)
+    if friend.state == FRIEND_APPROVED:
+        await bot.tell(user_id, approved_text(friend.jellyfin_name), login_view(user_id))
+    else:
+        await bot.tell(user_id, "❌ Deine Anfrage für einen Zugang zu Jellyfin wurde abgelehnt.")
+
+
+async def show_login(interaction: discord.Interaction, user_id: int) -> None:
+    """A new password plus the whole guide, visible only to the friend; nothing is stored."""
+    bot: SeerrBot = interaction.client  # type: ignore[assignment]
+    if interaction.user.id != user_id:
+        await interaction.response.send_message(NOT_YOURS, ephemeral=True)
+        return
+    friend = bot.store.friend(user_id)
+    if bot.jellyfin is None or friend is None or friend.state != FRIEND_APPROVED or not friend.jellyfin_id:
+        await interaction.response.send_message("🔒 Dein Zugang zu Jellyfin ist nicht (mehr) aktiv.", ephemeral=True)
+        return
+    last = bot.login_clicks.get(user_id, 0.0)
+    if time.monotonic() - last < LOGIN_COOLDOWN:
+        await interaction.response.send_message("⏳ Gerade eben gab es ein neues Passwort, es steht in der "
+                                                "Nachricht darüber.", ephemeral=True)
+        return
+    bot.login_clicks[user_id] = time.monotonic()
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    password = await asyncio.to_thread(bot.jellyfin.reset_password, friend.jellyfin_id)
+    text = welcome_text(friend.jellyfin_name, password, bot.settings.jellyfin_friend_url,
+                        bot.settings.tailscale_share_url)
+    await interaction.followup.send(text, ephemeral=True)
+
+
+class AccessForm(discord.ui.Modal, title="Zugang zu Jellyfin"):
+    def __init__(self, bot: SeerrBot, default: str) -> None:
+        super().__init__(timeout=600)
+        self.bot = bot
+        self.name = discord.ui.TextInput(label="Benutzername für Jellyfin", placeholder="z.B. max.muster",
+                                         default=default or None, min_length=3, max_length=20)
+        self.add_item(self.name)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        name = self.name.value.strip()
+        problem = check_name(name)
+        if problem is None and self.bot.store.name_taken(name, interaction.user.id):
+            problem = "Diesen Benutzernamen hat schon jemand angefragt. Nimm bitte einen anderen."
+        if problem:
+            await interaction.response.send_message(f"⚠️ {problem}", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if await asyncio.to_thread(self.bot.jellyfin.find_user, name) is not None:
+            await interaction.followup.send("⚠️ Diesen Benutzernamen gibt es in Jellyfin schon. Nimm bitte einen "
+                                            "anderen.", ephemeral=True)
+            return
+        await submit_friend_request(interaction, name, "")
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await report_error(interaction, error)
+
+
+async def submit_friend_request(interaction: discord.Interaction, name: str, jellyfin_id: str) -> None:
+    """Saves the request and posts Approve/Decline for the admins. The interaction must be deferred."""
+    bot: SeerrBot = interaction.client  # type: ignore[assignment]
+    async with bot._friend_lock:
+        friend = Friend(user_id=interaction.user.id, user_name=interaction.user.display_name, jellyfin_name=name,
+                        created=time.time(), jellyfin_id=jellyfin_id)
+        friend.card_text = friend_card_text(friend)
+        message = await bot.post(friend.card_text, view=friend_view(friend.user_id),
+                                 channel_id=bot.settings.approvals_channel)
+        friend.channel_id, friend.message_id = message.channel.id, message.id
+        bot.store.save_friend(friend)
+    await interaction.followup.send("📨 Anfrage gesendet. Sobald ein Admin sie freigibt, bekommst du eine Nachricht "
+                                    "vom Bot.", ephemeral=True)
 
 
 # --- pickers under a search result ---------------------------------------------
@@ -818,4 +1001,71 @@ def build_commands(bot: SeerrBot) -> list[app_commands.Command]:
         view = DeletePicker(bot, interaction.user, titles)
         view.message = await interaction.followup.send(embed=view.embed(view.current), view=view, wait=True)
 
-    return [film, serie, trending, neu, status, problem, loeschen]
+    commands = [film, serie, trending, neu, status, problem, loeschen]
+    if bot.jellyfin is not None:
+        commands += friend_commands(bot, requester)
+    return commands
+
+
+def friend_commands(bot: SeerrBot, requester) -> list[app_commands.Command]:
+    """/jellyfin-zugang for everyone who may request, the list and taking access away for admins."""
+    def friend_admin(interaction: discord.Interaction) -> bool:
+        if bot.is_admin(interaction):
+            return True
+        raise NotAllowed(NO_FRIEND_ADMIN)
+
+    @app_commands.command(name="jellyfin-zugang", description="Zugang zu Jellyfin beantragen, oder deine Zugangsdaten nochmals anzeigen")
+    @app_commands.check(requester)
+    async def jellyfin_zugang(interaction: discord.Interaction) -> None:
+        friend = bot.store.friend(interaction.user.id)
+        if friend is not None and friend.state == FRIEND_APPROVED:
+            await interaction.response.send_message(
+                f"✅ Du hast schon Zugang als **{escape(friend.jellyfin_name)}**. Mit dem Knopf bekommst du die "
+                "Anleitung und ein neues Passwort.", view=login_view(friend.user_id), ephemeral=True)
+        elif friend is not None and friend.state == FRIEND_PENDING:
+            await interaction.response.send_message("⏳ Deine Anfrage wartet noch auf Freigabe.", ephemeral=True)
+        elif (friend is not None and friend.state == FRIEND_DECLINED
+              and time.time() - friend.decided < DECLINED_WAIT_DAYS * 86400):
+            await interaction.response.send_message("❌ Deine letzte Anfrage wurde abgelehnt. Frag bei Bedarf "
+                                                    "direkt einen Admin.", ephemeral=True)
+        elif friend is not None and friend.jellyfin_id:
+            # had an account before: ask to open the same one again
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            await submit_friend_request(interaction, friend.jellyfin_name, friend.jellyfin_id)
+        else:
+            await interaction.response.send_modal(AccessForm(bot, suggest_name(interaction.user.display_name)))
+
+    @app_commands.command(name="jellyfin-entziehen", description="Den Zugang einer Person zu Jellyfin sperren (nur Admins)")
+    @app_commands.describe(person="Wer keinen Zugang mehr haben soll")
+    @app_commands.check(friend_admin)
+    async def jellyfin_entziehen(interaction: discord.Interaction, person: discord.User) -> None:
+        friend = bot.store.friend(person.id)
+        if friend is None or friend.state != FRIEND_APPROVED:
+            await interaction.response.send_message(f"ℹ️ {escape(person.display_name)} hat keinen aktiven Zugang.",
+                                                    ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with bot._friend_lock:
+            await asyncio.to_thread(bot.jellyfin.set_access, friend.jellyfin_id, False)
+            friend.state, friend.decided = FRIEND_REVOKED, time.time()
+            bot.store.save_friend(friend)
+        await interaction.followup.send(
+            f"🚫 Das Jellyfin-Konto **{escape(friend.jellyfin_name)}** ist gesperrt, die Person sieht keine Inhalte "
+            f"mehr. Im Tailscale-Share bleibt sie, bis du sie dort entfernst: <{TAILSCALE_ADMIN}> → jellyfin → "
+            "Share.", ephemeral=True)
+
+    @app_commands.command(name="jellyfin-liste", description="Wer Zugang zu Jellyfin hat oder angefragt hat (nur Admins)")
+    @app_commands.check(friend_admin)
+    async def jellyfin_liste(interaction: discord.Interaction) -> None:
+        icons = {FRIEND_PENDING: "⏳", FRIEND_APPROVED: "✅", FRIEND_DECLINED: "❌", FRIEND_REVOKED: "🚫"}
+        lines = []
+        for friend in bot.store.all_friends():
+            when = datetime.fromtimestamp(friend.decided or friend.created, bot.settings.zone).strftime("%d.%m.%Y")
+            lines.append(f"{icons.get(friend.state, '•')} <@{friend.user_id}> · **{escape(friend.jellyfin_name)}**"
+                         f" · {when}")
+        embed = discord.Embed(title="Zugang zu Jellyfin", color=discord.Color.blurple(),
+                              description="\n".join(lines)[:4000] or "Noch niemand hat angefragt.")
+        embed.set_footer(text="✅ hat Zugang · ⏳ wartet · ❌ abgelehnt · 🚫 gesperrt")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    return [jellyfin_zugang, jellyfin_entziehen, jellyfin_liste]

@@ -49,6 +49,15 @@ to Radarr or Sonarr as usual.
 - **Only where it belongs.** The bot answers in one channel; optionally only members with a role may request.
 - **Your search, your buttons.** Only the person who searched can pick and request.
 
+**Jellyfin accounts for friends** (optional, see [setup](#4-jellyfin-accounts-for-friends-optional))
+- **`/jellyfin-zugang`**: a short form asks for a user name; admins get *Freigeben* / *Ablehnen* buttons.
+- After approval the bot creates the Jellyfin account (only the libraries you name, no admin rights, nothing
+  to delete, a bitrate limit for remote streaming, hidden on the login page) and sends the friend a
+  *Zugangsdaten anzeigen* button, by DM or in the channel.
+- The button shows the whole guide, the Tailscale share link and a **fresh password that only this person
+  sees**. Passwords are never stored; a new click makes a new one, so it also works as "forgot password".
+- **`/jellyfin-liste`** and **`/jellyfin-entziehen <person>`** (admins only): who has access, and block an account.
+
 Seasons and quality are chosen per request; single episodes can't be requested, because Seerr only
 requests whole seasons.
 
@@ -59,13 +68,15 @@ flowchart LR
     D[Discord channel] -- /film, /serie, /status … --> B[Bot]
     B -- REST API + API key --> S[Seerr]
     S --> R[Radarr / Sonarr]
+    B -. optional: /jellyfin-zugang .-> J[Jellyfin]
     B -. state.json .- V[(data volume)]
 ```
 
-The bot only talks to Discord and to Seerr's API. Every two minutes it asks Seerr for new requests to
+The bot only talks to Discord, to Seerr's API and, if you set it up, to Jellyfin's API. Every two minutes it asks Seerr for new requests to
 approve and for finished downloads to announce. It keeps one small file, `state.json` in `DATA_DIR`
-(`/data` in Docker): who requested what through Discord, the approval messages it posted and the week
-of the last weekly post. Without it the bot still works, but forgets that on a restart.
+(`/data` in Docker): who requested what through Discord, the approval messages it posted, the week
+of the last weekly post and who asked for a Jellyfin account. Without it the bot still works, but forgets
+that on a restart.
 
 ## Setup
 
@@ -114,6 +125,25 @@ Check that it started: `docker logs seerrbot` should end with `Logged in as <you
 To update: `git pull`, then the same build and run again (remove the old container first with
 `docker rm -f seerrbot` when not using Compose).
 
+### 4. Jellyfin accounts for friends (optional)
+
+For friends who reach Jellyfin through a [Tailscale share](https://tailscale.com/kb/1084/sharing) of the
+Jellyfin machine. Needs admins (`DISCORD_ADMIN_USER_IDS` or `DISCORD_ADMIN_ROLE_ID`), because nobody
+gets an account without an approval.
+
+1. Jellyfin → **Dashboard → API Keys → +**. The key has admin rights: `JELLYFIN_API_KEY`.
+2. Tailscale admin console → **Machines** → your Jellyfin machine → **Share** → **Copy invite link** → turn on
+   **Reusable link** → **Copy share link**: `TAILSCALE_SHARE_URL`. The bot never gets a Tailscale key; anyone
+   with this link only sees the Jellyfin machine and still needs an account. If it leaks, revoke it there and
+   put a new one into `.env`; friends who lose access get the new link with their *Zugangsdaten anzeigen* button.
+3. `JELLYFIN_API_URL`: how the bot reaches Jellyfin (e.g. `http://192.168.1.30:8096`).
+   `JELLYFIN_FRIEND_URL`: the address friends type into the app (the machine's Tailscale IP with port 8096).
+4. Optional: `JELLYFIN_FRIEND_LIBRARIES` (e.g. `Movies,Shows`) and `JELLYFIN_FRIEND_BITRATE_MBIT` (default 4).
+
+The three commands appear once all four required values are set. Taking access away blocks the Jellyfin
+account, so the person can't watch anything any more. The Tailscale share stays until you remove it in
+Tailscale (Machines → Jellyfin → Share); the bot has no Tailscale access.
+
 Without Docker (Python 3.11 or newer):
 
 ```bash
@@ -138,6 +168,11 @@ python -m bot    # remembers its state in ./data unless DATA_DIR says otherwise
 | `WEEKLY_DIGEST` | empty | Post what's new every week, e.g. `sun 18:00` or `so 18:00`; empty = off |
 | `TIMEZONE` | `UTC` | For the weekly post and dates, e.g. `Europe/Zurich` |
 | `JELLYFIN_URL` | empty | Jellyfin's address for the *Jetzt ansehen* buttons; empty = the one Seerr uses |
+| `JELLYFIN_API_URL`, `JELLYFIN_API_KEY` | empty | `/jellyfin-zugang`: how the bot reaches Jellyfin, and an API key from Jellyfin's dashboard |
+| `JELLYFIN_FRIEND_URL` | empty | `/jellyfin-zugang`: the server address friends enter in the Jellyfin app |
+| `TAILSCALE_SHARE_URL` | empty | `/jellyfin-zugang`: multi-use share link for the Jellyfin machine |
+| `JELLYFIN_FRIEND_LIBRARIES` | empty = all | Libraries friends may see, by name, e.g. `Movies,Shows` |
+| `JELLYFIN_FRIEND_BITRATE_MBIT` | `4` | Bitrate limit for friends streaming from outside; `0` = none |
 | `DATA_DIR` | `data` (`/data` in Docker) | Where `state.json` is kept |
 | `SEERR_URL` | `http://localhost:5055` | How the bot reaches Seerr |
 | `SEERR_API_KEY` | – | Seerr API key |
@@ -154,7 +189,10 @@ python -m bot    # remembers its state in ./data unless DATA_DIR says otherwise
 - `/löschen` removes files for good. Only the admins you list can use it, and it always asks twice.
 - Approve and decline buttons check on every click that the person is an admin.
 - The bot only ever mentions the person who made a request, never `@everyone` or roles.
-- `state.json` holds Discord user IDs and display names of people who requested something, nothing else.
+- `state.json` holds Discord user IDs and display names of people who requested something, and for Jellyfin
+  accounts the user name, the account ID and the state. Never a password.
+- The Jellyfin API key can do everything an admin can. Friends' accounts are only created after an admin's
+  click, and a password is only shown to the person whose button it is.
 
 ## Deleting and hardlinks
 
@@ -177,6 +215,8 @@ that removes finished torrents, or remove them by hand, so `/löschen` really fr
 | Nobody is told when something is there | That only works for requests made through the bot, and the bot must keep its `state.json` (Docker: the `seerrbot-data` volume). Check the log for `Could not save`. |
 | No quality choice appears | The names in `MOVIE_PROFILES`/`TV_PROFILES` must match profiles in Radarr/Sonarr; the log lists the ones it didn't find. With only one name there is nothing to choose, it is just used. |
 | The *Jetzt ansehen* button opens an address nobody can reach | Set `JELLYFIN_URL` to Jellyfin's address as people open it. |
+| `/jellyfin-zugang` doesn't show up | All of `JELLYFIN_API_URL`, `JELLYFIN_API_KEY`, `JELLYFIN_FRIEND_URL`, `TAILSCALE_SHARE_URL` and an admin setting are needed. |
+| „Jellyfin lehnt den API-Schlüssel ab“ or „Diese Jellyfin-Bibliotheken gibt es nicht“ | Check `JELLYFIN_API_KEY`, and that the names in `JELLYFIN_FRIEND_LIBRARIES` match the libraries in Jellyfin. |
 
 Logs: `docker logs --tail 50 seerrbot`.
 

@@ -3,6 +3,7 @@
 - who requested what through Discord (for /status, the "it's there" message and the limit per person)
 - the approval messages it posted, so it can update them
 - the week of the last weekly digest
+- who asked for a Jellyfin account (/jellyfin-zugang) and how it was decided; never a password
 
 Without a writable data folder the bot keeps this in memory only and logs why.
 """
@@ -45,6 +46,23 @@ class Approval:
     closed: bool = False
 
 
+FRIEND_PENDING, FRIEND_APPROVED, FRIEND_DECLINED, FRIEND_REVOKED = "pending", "approved", "declined", "revoked"
+
+
+@dataclass
+class Friend:
+    user_id: int  # Discord
+    user_name: str  # Discord display name when asking
+    jellyfin_name: str
+    created: float
+    state: str = FRIEND_PENDING
+    jellyfin_id: str = ""  # set once the account exists, kept when access is taken away
+    channel_id: int = 0  # the approval message
+    message_id: int = 0
+    card_text: str = ""
+    decided: float = 0.0
+
+
 def _load_items(cls: type, items: Any) -> list:
     names = {f.name for f in fields(cls)}
     loaded = []
@@ -63,6 +81,7 @@ class Store:
         self._now = now
         self.requests: dict[int, Tracked] = {}
         self.approvals: dict[int, Approval] = {}
+        self.friends: dict[int, Friend] = {}
         self.digest = ""
         self._load()
 
@@ -82,6 +101,7 @@ class Store:
             return
         self.requests = {t.request_id: t for t in _load_items(Tracked, data.get("requests"))}
         self.approvals = {a.request_id: a for a in _load_items(Approval, data.get("approvals"))}
+        self.friends = {f.user_id: f for f in _load_items(Friend, data.get("friends"))}
         self.digest = str(data.get("digest") or "")
 
     def save(self) -> None:
@@ -91,6 +111,7 @@ class Store:
         data = {
             "requests": [asdict(t) for t in self.requests.values()],
             "approvals": [asdict(a) for a in self.approvals.values()],
+            "friends": [asdict(f) for f in self.friends.values()],
             "digest": self.digest,
         }
         tmp = None
@@ -154,6 +175,23 @@ class Store:
         if approval is not None and not approval.closed:
             approval.closed = True
             self.save()
+
+    # --- Jellyfin accounts for friends -------------------------------------------------
+    def friend(self, user_id: int) -> Friend | None:
+        return self.friends.get(user_id)
+
+    def all_friends(self) -> list[Friend]:
+        return sorted(self.friends.values(), key=lambda f: f.created)
+
+    def save_friend(self, friend: Friend) -> None:
+        self.friends[friend.user_id] = friend
+        self.save()
+
+    def name_taken(self, name: str, user_id: int) -> bool:
+        """Another person already asked for this Jellyfin name (case doesn't matter)."""
+        wanted = name.casefold()
+        return any(f.jellyfin_name.casefold() == wanted and f.user_id != user_id
+                   and f.state != FRIEND_DECLINED for f in self.friends.values())
 
     # --- weekly digest -----------------------------------------------------------
     def set_digest(self, key: str) -> None:
