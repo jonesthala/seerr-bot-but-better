@@ -89,12 +89,16 @@ class SeerrClient:
         self._fetch = fetch
         self._names: dict[tuple[str, int], str] = {}
 
-    def _call(self, method: str, path: str, query: dict[str, Any] | None = None, body: dict | None = None) -> Any:
+    def _call(self, method: str, path: str, query: dict[str, Any] | None = None, body: dict | None = None,
+              as_user: int | None = None) -> Any:
         url = f"{self.base_url}/api/v1{path}"
         if query:
             # Seerr wants reserved characters like ! ' ( ) percent-encoded, so quote with safe="".
             url += "?" + urllib.parse.urlencode(query, quote_via=urllib.parse.quote, safe="")
         headers = {"X-Api-Key": self.api_key, "Accept": "application/json", "User-Agent": USER_AGENT}
+        if as_user:
+            # Act as that Seerr user instead of the key's owner, so its permissions apply.
+            headers["X-API-User"] = str(as_user)
         data = None
         if body is not None:
             headers["Content-Type"] = "application/json"
@@ -237,9 +241,10 @@ class SeerrClient:
             body["seasons"] = wanted
         if profile_id is not None:
             body["profileId"] = profile_id
-        if self.user_id:
-            body["userId"] = self.user_id
-        data = self._call("POST", "/request", body=body)
+        # Seerr decides about auto-approval by who *makes* the request. With "userId" in the body the key's
+        # owner (an admin) makes it, so it would always be approved at once. Acting as the user instead makes
+        # Seerr apply that user's permissions: without auto-approve the request waits for an admin.
+        data = self._call("POST", "/request", body=body, as_user=self.user_id)
         status = data.get("status") if isinstance(data, dict) else None
         request_id = data.get("id") if isinstance(data, dict) else None
         return Requested(status if isinstance(status, int) else 1, request_id if isinstance(request_id, int) else None)

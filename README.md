@@ -82,9 +82,11 @@ of the last weekly post. Without it the bot still works, but forgets that on a r
 
 Seerr → **Settings → General → API Key**. The key has admin rights, keep it private.
 
-Optional: create a Seerr user for Discord requests (Settings → Users) **without** "Auto-Approve" and put
-its ID into `SEERR_USER_ID`. Requests then wait for approval: in Seerr, or with the buttons in Discord once
-`DISCORD_ADMIN_USER_IDS` or `DISCORD_ADMIN_ROLE_ID` is set.
+Optional: create a Seerr user for Discord requests (Settings → Users) with the *Request* permission but
+**without** "Auto-Approve", and put its ID into `SEERR_USER_ID`. The bot then makes requests *as* that user
+(Seerr's `X-API-User` header), so its permissions apply and requests wait for approval: in Seerr, or with
+the buttons in Discord once `DISCORD_ADMIN_USER_IDS` or `DISCORD_ADMIN_ROLE_ID` is set. Without
+`SEERR_USER_ID`, requests are made by the API key's owner, an admin, and start at once.
 
 If you offer quality profiles (`MOVIE_PROFILES`, `TV_PROFILES`) and Seerr ignores the choice, give that
 user the *Advanced Requests* permission in Seerr.
@@ -140,7 +142,7 @@ python -m bot    # remembers its state in ./data unless DATA_DIR says otherwise
 | `SEERR_URL` | `http://localhost:5055` | How the bot reaches Seerr |
 | `SEERR_API_KEY` | – | Seerr API key |
 | `SEERR_LANGUAGE` | `de` | Language of titles and descriptions |
-| `SEERR_USER_ID` | empty | Request for this Seerr user instead of the key's owner |
+| `SEERR_USER_ID` | empty | Make requests as this Seerr user; its permissions decide whether they wait for approval |
 | `SEERR_PUBLIC_URL` | empty | Link to Seerr in the bot's messages |
 
 ## Security

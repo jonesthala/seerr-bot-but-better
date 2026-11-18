@@ -52,7 +52,8 @@ class ApprovalTest(unittest.TestCase):
         fake = FakeSeerr({("POST", "/request"): (201, {"id": 9, "status": REQUEST_PENDING})})
         result = client(fake, user_id=2).request(title_from(SEARCH["results"][0]), profile_id=5)
         self.assertEqual((result.status, result.request_id), (REQUEST_PENDING, 9))
-        self.assertEqual(fake.posted()[0]["body"], {"mediaType": "movie", "mediaId": 45745, "profileId": 5, "userId": 2})
+        self.assertEqual(fake.posted()[0]["body"], {"mediaType": "movie", "mediaId": 45745, "profileId": 5})
+        self.assertEqual(fake.posted()[0]["headers"]["X-API-User"], "2")
 
 
 class IssueTest(unittest.TestCase):

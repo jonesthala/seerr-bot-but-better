@@ -76,7 +76,15 @@ class RequestTest(unittest.TestCase):
         fake = FakeSeerr({("POST", "/request"): (201, {"status": 1})})
         title = title_from(TV, "tv")
         self.assertEqual(client(fake, user_id=5).request(title), Requested(1, None))
-        self.assertEqual(fake.posted()[0]["body"], {"mediaType": "tv", "mediaId": 30010, "seasons": [2], "userId": 5})
+        # Made *as* user 5 (its permissions decide about approval), not by the key's owner *for* user 5
+        self.assertEqual(fake.posted()[0]["body"], {"mediaType": "tv", "mediaId": 30010, "seasons": [2]})
+        self.assertEqual(fake.posted()[0]["headers"]["X-API-User"], "5")
+        self.assertNotIn("X-API-User", fake.calls[0]["headers"])  # free space is read as the key's owner
+
+    def test_without_user_the_key_owner_requests(self):
+        fake = FakeSeerr({("POST", "/request"): (201, {"status": 2})})
+        client(fake).request(title_from(SEARCH["results"][0]))
+        self.assertNotIn("X-API-User", fake.posted()[0]["headers"])
 
     def test_tv_chosen_seasons(self):
         fake = FakeSeerr({("POST", "/request"): (201, {"status": 2})})
