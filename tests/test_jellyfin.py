@@ -147,7 +147,8 @@ class ClientTest(unittest.TestCase):
 class WelcomeTest(unittest.TestCase):
     def test_contains_everything(self):
         text = welcome_text("max", "pw123", "http://100.1.2.3:8096", "https://login.tailscale.com/admin/invite/x")
-        for part in ("max", "pw123", "http://100.1.2.3:8096", "https://login.tailscale.com/admin/invite/x"):
+        for part in ("max", "pw123", "http://100.1.2.3:8096", "https://login.tailscale.com/admin/invite/x",
+                     "Quick Connect", "SyncPlay"):
             self.assertIn(part, text)
         self.assertLess(len(text), 2000)  # one Discord message
 

@@ -179,6 +179,10 @@ def welcome_text(name: str, password: str, server_url: str, share_url: str) -> s
         "PC: im Browser\n\n"
         "**4. Verbinden** (Tailscale muss eingeschaltet sein)\n"
         f"Server: `{server_url}`\nBenutzer: `{name}`\nPasswort: `{password}`\n\n"
+        "📺 **Am Fernseher** musst du kein Passwort tippen: In der TV-App «Quick Connect» wählen, dann am Handy "
+        "in der Jellyfin-App unter deinem Profil → «Quick Connect» den angezeigten Code eingeben.\n"
+        "🍿 **Zusammen schauen:** Mit SyncPlay (Gruppen-Symbol oben in der App) schaut ihr denselben Film "
+        "gleichzeitig, jeder bei sich. Wer pausiert, pausiert für alle.\n\n"
         "Speichere das Passwort, diese Nachricht verschwindet. Ein neuer Klick auf den Knopf setzt ein neues "
         "Passwort, das alte gilt dann nicht mehr. Bitte gib Link und Login nicht weiter. Viel Spass! 🍿"
     )
