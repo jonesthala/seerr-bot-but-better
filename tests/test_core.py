@@ -134,6 +134,16 @@ class OpenRequestsTest(unittest.TestCase):
         data = {"results": [{"status": 2, "type": "movie", "media": {"tmdbId": 5, "status": PROCESSING}}]}
         self.assertIn("wird gesucht", open_requests(data)[0].line("X"))
 
+    def test_partly_there(self):
+        data = {"results": [
+            {"status": REQUEST_APPROVED, "type": "tv", "media": {"tmdbId": 6, "status": PARTIAL}},
+            {"status": REQUEST_APPROVED, "type": "tv", "media": {"tmdbId": 7, "status": PARTIAL,
+             "downloadStatus": [{"size": 1000, "sizeLeft": 500}]}},
+        ]}
+        searching, loading = open_requests(data)
+        self.assertEqual(searching.line("X"), "**X** · 🟡 teilweise da, der Rest wird gesucht")
+        self.assertEqual(loading.line("Y"), "**Y** · 🟡 teilweise da · ⬇️ wird geladen, 50 %")
+
 
 class LibraryTest(unittest.TestCase):
     def test_media_id_and_library(self):

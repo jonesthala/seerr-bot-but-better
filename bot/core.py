@@ -315,6 +315,10 @@ class OpenRequest:
             rest = eta_text(self.eta, now or datetime.now(timezone.utc))
             if rest:
                 state += f", {rest}"
+            if self.media_status == PARTIAL:
+                state = "🟡 teilweise da · " + state
+        elif self.media_status == PARTIAL:
+            state = "🟡 teilweise da, der Rest wird gesucht"
         else:
             state = "🔎 wird gesucht"
         who = who or self.requested_by
