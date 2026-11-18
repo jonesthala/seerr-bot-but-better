@@ -12,16 +12,28 @@ import urllib.request
 from typing import Any, Callable
 
 from .core import (
+    AVAILABLE,
     GB,
+    ISSUE_TYPES,
+    PARTIAL,
+    NewMedia,
     OpenRequest,
+    Requested,
+    RequestState,
     SeerrError,
     Title,
+    new_media,
     no_space_text,
     open_requests,
+    pending_requests,
+    pick_profiles,
     pick_server,
+    request_state,
     root_folder_free,
     search_results,
+    seasons_done,
     title_from,
+    trending_results,
 )
 
 log = logging.getLogger("seerrbot.seerr")
@@ -96,7 +108,7 @@ class SeerrClient:
             return answer
         detail = answer.get("message") if isinstance(answer, dict) else answer
         log.warning("%s %s → HTTP %s %s", method, path, status, detail)
-        raise SeerrError(_error_text(status, path))
+        raise SeerrError(_error_text(status, path), status)
 
     # --- reading -----------------------------------------------------------
     def search(self, query: str, kind: str | None, library_only: bool = False) -> list[Title]:
@@ -160,9 +172,58 @@ class SeerrClient:
                 values.append(free)
         return min(values) if values else None
 
+    def request_state(self, request_id: int) -> RequestState | None:
+        """One request as Seerr sees it now; None if it doesn't exist any more."""
+        try:
+            data = self._call("GET", f"/request/{int(request_id)}")
+        except SeerrError as error:
+            if error.status == 404:
+                return None
+            raise
+        return request_state(data)
+
+    def is_done(self, state: RequestState) -> bool:
+        """Everything that was requested is in the library (for shows: all requested seasons)."""
+        if state.media_status == AVAILABLE:
+            return True
+        if state.kind == "tv" and state.media_status == PARTIAL and state.seasons:
+            return seasons_done(self.details("tv", state.tmdb_id), state.seasons)
+        return False
+
+    def pending_requests(self, limit: int = 20) -> list[RequestState]:
+        """Requests waiting for approval, newest first."""
+        data = self._call("GET", "/request", {"take": limit, "skip": 0, "filter": "pending", "sort": "added"})
+        return pending_requests(data)
+
+    def trending(self, kind: str | None = None, limit: int = 10) -> list[Title]:
+        data = self._call("GET", "/discover/trending", {"page": 1, "language": self.language})
+        titles = trending_results(data, kind, limit)
+        for title in titles:
+            self._names[(title.kind, title.tmdb_id)] = title.label
+        return titles
+
+    def recently_added(self, limit: int = 10) -> list[NewMedia]:
+        """What came into the library last, newest first."""
+        data = self._call("GET", "/media", {"take": limit, "skip": 0, "filter": "available", "sort": "mediaAdded"})
+        return new_media(data)
+
+    def profiles(self, kind: str, names: list[str]) -> list[tuple[int, str]]:
+        """The quality profiles called names on the default Radarr ("movie") or Sonarr ("tv") server."""
+        if not names:
+            return []
+        service = "radarr" if kind == "movie" else "sonarr"
+        server = pick_server(self._call("GET", f"/service/{service}"))
+        if server is None:
+            return []
+        found = pick_profiles(self._call("GET", f"/service/{service}/{server['id']}"), names)
+        missing = {n.strip().lower() for n in names} - {name.lower() for _, name in found}
+        if missing:
+            log.warning("Quality profiles not found in %s: %s", service, ", ".join(sorted(missing)))
+        return found
+
     # --- writing -----------------------------------------------------------
-    def request(self, title: Title, seasons: list[int] | None = None) -> int:
-        """Creates a request; returns its status (1 = waits for approval, 2 = approved)."""
+    def request(self, title: Title, seasons: list[int] | None = None, profile_id: int | None = None) -> Requested:
+        """Creates a request; returns its status (1 = waits for approval, 2 = approved) and id."""
         if not title.requestable:
             raise SeerrError(f"**{title.label}**: {title.status_text()}")
         free = self.free_bytes(title.kind)
@@ -174,11 +235,35 @@ class SeerrClient:
             if not wanted:
                 raise SeerrError(f"Von **{title.label}** gibt es keine Staffel, die noch fehlt.")
             body["seasons"] = wanted
+        if profile_id is not None:
+            body["profileId"] = profile_id
         if self.user_id:
             body["userId"] = self.user_id
         data = self._call("POST", "/request", body=body)
         status = data.get("status") if isinstance(data, dict) else None
-        return status if isinstance(status, int) else 1
+        request_id = data.get("id") if isinstance(data, dict) else None
+        return Requested(status if isinstance(status, int) else 1, request_id if isinstance(request_id, int) else None)
+
+    def set_request_status(self, request_id: int, action: str) -> None:
+        """Approves ("approve") or declines ("decline") a request."""
+        if action not in ("approve", "decline"):
+            raise ValueError(action)
+        self._call("POST", f"/request/{int(request_id)}/{action}")
+
+    def report_issue(self, title: Title, issue_type: int, message: str,
+                     season: int | None = None, episode: int | None = None) -> int | None:
+        """Opens an issue in Seerr (1 picture, 2 sound, 3 subtitles, 4 other); returns its id."""
+        if title.media_id is None or not title.in_library:
+            raise SeerrError(f"**{title.label}** ist nicht in der Bibliothek, dazu kann man kein Problem melden.")
+        if issue_type not in ISSUE_TYPES:
+            raise ValueError(issue_type)
+        body: dict[str, Any] = {"issueType": issue_type, "message": message.strip(), "mediaId": title.media_id}
+        if title.kind == "tv":
+            body["problemSeason"] = season or 0
+            body["problemEpisode"] = (episode or 0) if season else 0  # an episode only makes sense with its season
+        data = self._call("POST", "/issue", body=body)
+        issue_id = data.get("id") if isinstance(data, dict) else None
+        return issue_id if isinstance(issue_id, int) else None
 
     def delete(self, title: Title) -> None:
         """Removes a movie or show (all seasons) from Radarr/Sonarr with its files, then resets it in Seerr."""

@@ -4,7 +4,7 @@ import unittest
 import urllib.error
 from unittest import mock
 
-from bot.core import AVAILABLE, GB, PARTIAL, REQUEST_APPROVED, SeerrError, title_from
+from bot.core import AVAILABLE, GB, PARTIAL, REQUEST_APPROVED, Requested, SeerrError, title_from
 from bot.seerr import UNREACHABLE, SeerrClient, http_fetch
 
 BASE = "http://seerr.test:5055"
@@ -67,7 +67,7 @@ class RequestTest(unittest.TestCase):
     def test_movie(self):
         fake = FakeSeerr({("POST", "/request"): (201, {"id": 7, "status": REQUEST_APPROVED})})
         title = title_from(SEARCH["results"][0])
-        self.assertEqual(client(fake).request(title), REQUEST_APPROVED)
+        self.assertEqual(client(fake).request(title), Requested(REQUEST_APPROVED, 7))
         self.assertEqual(fake.posted()[0]["body"], {"mediaType": "movie", "mediaId": 45745})
         self.assertEqual(fake.posted()[0]["headers"]["Content-Type"], "application/json")
         self.assertEqual([c["path"] for c in fake.calls], ["/service/radarr", "/request"])  # space first
@@ -75,7 +75,7 @@ class RequestTest(unittest.TestCase):
     def test_tv_missing_seasons_by_default_and_as_user(self):
         fake = FakeSeerr({("POST", "/request"): (201, {"status": 1})})
         title = title_from(TV, "tv")
-        self.assertEqual(client(fake, user_id=5).request(title), 1)
+        self.assertEqual(client(fake, user_id=5).request(title), Requested(1, None))
         self.assertEqual(fake.posted()[0]["body"], {"mediaType": "tv", "mediaId": 30010, "seasons": [2], "userId": 5})
 
     def test_tv_chosen_seasons(self):
@@ -110,7 +110,7 @@ class SpaceTest(unittest.TestCase):
         fake = FakeSeerr({("GET", "/service/radarr"): (500, None), ("POST", "/request"): (201, {"status": 2})})
         with self.assertLogs("seerrbot.seerr", "WARNING"):
             self.assertIsNone(client(fake).free_bytes("movie"))
-            self.assertEqual(client(fake).request(title_from(SEARCH["results"][0])), 2)
+            self.assertEqual(client(fake).request(title_from(SEARCH["results"][0])).status, 2)
 
     def test_request_refused_when_full(self):
         fake = FakeSeerr({**SONARR, ("POST", "/request"): (201, {"status": 2})})
@@ -119,7 +119,7 @@ class SpaceTest(unittest.TestCase):
         self.assertIn("Kein Platz", str(caught.exception))
         self.assertIn("12 GB", str(caught.exception))
         self.assertEqual(fake.posted(), [])
-        self.assertEqual(client(fake, min_free=10 * GB).request(title_from(TV, "tv")), 2)
+        self.assertEqual(client(fake, min_free=10 * GB).request(title_from(TV, "tv")).status, 2)
 
 
 class DeleteTest(unittest.TestCase):

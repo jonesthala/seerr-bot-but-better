@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import timezone, tzinfo
+from urllib.parse import urlsplit
+
+from .core import parse_digest
 
 TOKEN_HELP = "Use the bot token: Developer Portal -> your app -> Bot -> Reset Token."
 
@@ -59,6 +63,24 @@ def _id_set(name: str) -> frozenset[int]:
         raise ConfigError(f"{name} must be a comma-separated list of numbers") from exc
 
 
+def _names(name: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in _text(name).split(",") if part.strip())
+
+
+def _zone(name: str) -> tzinfo:
+    value = _text(name, "UTC") or "UTC"
+    if value.upper() == "UTC":
+        return timezone.utc
+    try:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    except ImportError as exc:  # pragma: no cover - Python < 3.9
+        raise ConfigError("TIMEZONE needs Python 3.9 or newer") from exc
+    try:
+        return ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ConfigError(f"{name} is not a known time zone, e.g. Europe/Zurich") from exc
+
+
 @dataclass(frozen=True)
 class Settings:
     discord_token: str
@@ -73,10 +95,44 @@ class Settings:
     seerr_user_id: int | None
     seerr_public_url: str
     min_free_gb: int = 15
+    approval_channel_id: int | None = None
+    data_dir: str = "data"
+    request_limit: int = 0
+    request_limit_days: int = 7
+    weekly_digest: tuple[int, int, int] | None = None
+    zone: tzinfo = field(default=timezone.utc)
+    movie_profiles: tuple[str, ...] = ()
+    tv_profiles: tuple[str, ...] = ()
+    jellyfin_url: str = ""
+
+    def watch_url(self, url: str | None) -> str | None:
+        """Seerr's link to a title in Jellyfin, with JELLYFIN_URL as its address if that is set."""
+        if not url:
+            return None
+        if not self.jellyfin_url:
+            return url
+        parts = urlsplit(url)
+        return self.jellyfin_url + url[len(f"{parts.scheme}://{parts.netloc}"):]
+
+    @property
+    def has_admins(self) -> bool:
+        return self.admin_role_id is not None or bool(self.admin_user_ids)
 
     @property
     def deleting_enabled(self) -> bool:
-        return self.admin_role_id is not None or bool(self.admin_user_ids)
+        return self.has_admins
+
+    @property
+    def approvals_enabled(self) -> bool:
+        """Pending requests get Approve/Decline buttons in Discord."""
+        return self.has_admins
+
+    @property
+    def approvals_channel(self) -> int:
+        return self.approval_channel_id or self.channel_id
+
+    def profile_names(self, kind: str) -> tuple[str, ...]:
+        return self.movie_profiles if kind == "movie" else self.tv_profiles
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -86,6 +142,16 @@ class Settings:
         public = _text("SEERR_PUBLIC_URL").rstrip("/")
         if public and not public.startswith(("http://", "https://")):
             raise ConfigError("SEERR_PUBLIC_URL must start with http:// or https://")
+        jellyfin = _text("JELLYFIN_URL").rstrip("/")
+        if jellyfin and not jellyfin.startswith(("http://", "https://")):
+            raise ConfigError("JELLYFIN_URL must start with http:// or https://")
+        try:
+            digest = parse_digest(_text("WEEKLY_DIGEST"))
+        except ValueError as exc:
+            raise ConfigError("WEEKLY_DIGEST must look like 'sun 18:00' (or empty to switch it off)") from exc
+        limit, limit_days = _int("REQUEST_LIMIT", 0), _int("REQUEST_LIMIT_DAYS", 7)
+        if limit < 0 or limit_days < 1:
+            raise ConfigError("REQUEST_LIMIT must be 0 or more and REQUEST_LIMIT_DAYS at least 1")
         return cls(
             discord_token=_token(),
             guild_id=_int("DISCORD_GUILD_ID"),
@@ -99,8 +165,20 @@ class Settings:
             seerr_user_id=_int("SEERR_USER_ID", 0) or None,
             seerr_public_url=public,
             min_free_gb=_int("MIN_FREE_GB", 15),
+            approval_channel_id=_int("DISCORD_APPROVAL_CHANNEL_ID", 0) or None,
+            data_dir=_text("DATA_DIR") or "data",
+            request_limit=limit,
+            request_limit_days=limit_days,
+            weekly_digest=digest,
+            zone=_zone("TIMEZONE"),
+            movie_profiles=_names("MOVIE_PROFILES"),
+            tv_profiles=_names("TV_PROFILES"),
+            jellyfin_url=jellyfin,
         )
 
     def page_url(self, kind: str, tmdb_id: int) -> str | None:
         """Link to the movie or show in Seerr, if a public address is set."""
         return f"{self.seerr_public_url}/{kind}/{tmdb_id}" if self.seerr_public_url else None
+
+    def issue_url(self, issue_id: int | None) -> str | None:
+        return f"{self.seerr_public_url}/issues/{issue_id}" if self.seerr_public_url and issue_id else None

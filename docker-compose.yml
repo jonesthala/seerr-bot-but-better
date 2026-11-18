@@ -4,3 +4,8 @@ services:
     container_name: seerrbot
     restart: unless-stopped
     env_file: .env
+    volumes:
+      - seerrbot-data:/data  # who requested what, approval messages
+
+volumes:
+  seerrbot-data:

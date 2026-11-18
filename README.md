@@ -5,41 +5,67 @@ poster and whether a title is already there, and requests it with one click. See
 to Radarr or Sonarr as usual.
 
 ```text
-/film Sintel
+/film Sint…        (suggestions while you type: Sintel (2010) · Film · ➕ Noch nicht da …)
   Sintel (2010) · ➕ Noch nicht da, kann angefragt werden      [📥 Anfragen] [Abbrechen]
-  ✅ Angefragt! Der Film wird jetzt gesucht und geladen. Sobald alles da ist, taucht es in Jellyfin auf.
+  ⏳ Angefragt! Der Film wartet noch auf die Freigabe durch einen Admin. Ich sage dir hier Bescheid, sobald alles da ist.
+
+  📥 Neue Anfrage von alex: Sintel (2010). Wartet auf Freigabe.      [✅ Freigeben] [✖️ Ablehnen]
 
 /status
-  Sintel (2010) · ⬇️ wird geladen, 45 % · von alex
+  Sintel (2010) · ⬇️ wird geladen, 45 %, noch ca. 20 Min. · von alex
+
+  🍿 @alex Sintel (2010) ist jetzt da. Viel Spass!      [▶️ Jetzt ansehen]
 ```
 
 > The bot's messages are in German.
 
 ## Features
 
+**Requesting**
 - **`/film <titel>` and `/serie <titel>`**: up to five hits to pick from, with poster, year, short
-  description and status (already there, partly there, requested, downloading).
+  description and status (already there, partly there, requested, downloading). Discord **suggests
+  titles while you type**; picking one opens it directly.
 - **Seasons.** For shows, the missing seasons are preselected; you can narrow them down. Specials are left out.
-- **`/status`**: requests waiting for approval, what is being searched or downloaded (with progress) and free space.
+- **Quality or language** (optional): offer some of your Radarr/Sonarr quality profiles, e.g. 1080p and 4K,
+  or a German and an original-language profile.
+- **`/trending`**: what is popular right now, ready to request.
+- **Limit per person** (optional), e.g. 3 requests per week. Admins have no limit.
+
+**Following up**
+- **Approval in Discord.** Requests that wait for approval (also those made in Seerr itself) get
+  *Freigeben* / *Ablehnen* buttons that only admins can use. Requests handled in Seerr update the message.
+- **"It's there."** The bot remembers who requested what and mentions them when it is in the library,
+  with a *Jetzt ansehen* button to Jellyfin. Also when a request was declined.
+- **`/status`**: requests waiting for approval, what is being searched or downloaded (with progress and
+  time left), who asked for it, and free space.
+- **`/neu`**: what came into the library last, with links. Optionally as a **weekly post** in the channel.
+- **`/problem <titel>`**: report a problem (picture, sound, subtitles, other) as an issue in Seerr.
+
+**Housekeeping**
 - **Watches the disk.** Below `MIN_FREE_GB` free, new requests are refused with a clear message, and the
   bot posts once in the channel when space gets low and once when it is fine again.
 - **`/löschen <titel>`** (admins only): pick a movie or show from the library and delete it, files
   included, after a second confirmation click. It is reset in Seerr, so it can be requested again later.
 - **Only where it belongs.** The bot answers in one channel; optionally only members with a role may request.
-- **Approval stays in Seerr.** Requests can be made for a Seerr user without auto-approve, so they
-  wait for an admin, or as the admin, so they start at once.
 - **Your search, your buttons.** Only the person who searched can pick and request.
+
+Seasons and quality are chosen per request; single episodes can't be requested, because Seerr only
+requests whole seasons.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    D[Discord channel] -- /film, /serie, /status --> B[Bot]
+    D[Discord channel] -- /film, /serie, /status … --> B[Bot]
     B -- REST API + API key --> S[Seerr]
     S --> R[Radarr / Sonarr]
+    B -. state.json .- V[(data volume)]
 ```
 
-The bot only talks to Discord and to Seerr's API. It stores nothing.
+The bot only talks to Discord and to Seerr's API. Every two minutes it asks Seerr for new requests to
+approve and for finished downloads to announce. It keeps one small file, `state.json` in `DATA_DIR`
+(`/data` in Docker): who requested what through Discord, the approval messages it posted and the week
+of the last weekly post. Without it the bot still works, but forgets that on a restart.
 
 ## Setup
 
@@ -57,7 +83,11 @@ The bot only talks to Discord and to Seerr's API. It stores nothing.
 Seerr → **Settings → General → API Key**. The key has admin rights, keep it private.
 
 Optional: create a Seerr user for Discord requests (Settings → Users) **without** "Auto-Approve" and put
-its ID into `SEERR_USER_ID`. Requests then wait for your approval in Seerr.
+its ID into `SEERR_USER_ID`. Requests then wait for approval: in Seerr, or with the buttons in Discord once
+`DISCORD_ADMIN_USER_IDS` or `DISCORD_ADMIN_ROLE_ID` is set.
+
+If you offer quality profiles (`MOVIE_PROFILES`, `TV_PROFILES`) and Seerr ignores the choice, give that
+user the *Advanced Requests* permission in Seerr.
 
 ### 3. Run it
 
@@ -71,8 +101,10 @@ Without Docker Compose:
 
 ```bash
 docker build -t seerrbot .
-docker run -d --name seerrbot --restart unless-stopped --env-file .env seerrbot
+docker run -d --name seerrbot --restart unless-stopped --env-file .env -v seerrbot-data:/data seerrbot
 ```
+
+The volume `seerrbot-data` keeps `state.json` (who requested what) across updates.
 
 Check that it started: `docker logs seerrbot` should end with `Logged in as <your bot>`. Then try
 `/film Sintel` in your channel.
@@ -86,7 +118,7 @@ Without Docker (Python 3.11 or newer):
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 set -a && . ./.env && set +a
-python -m bot
+python -m bot    # remembers its state in ./data unless DATA_DIR says otherwise
 ```
 
 ## Settings
@@ -96,8 +128,15 @@ python -m bot
 | `DISCORD_TOKEN` | – | Bot token |
 | `DISCORD_GUILD_ID`, `DISCORD_CHANNEL_ID` | – | Server and channel the bot works in |
 | `DISCORD_REQUEST_ROLE_ID` | empty | Only this role may search and request; empty = everyone in the channel |
-| `DISCORD_ADMIN_ROLE_ID`, `DISCORD_ADMIN_USER_IDS` | empty | Who may use `/löschen`; both empty = deleting is off |
+| `DISCORD_ADMIN_ROLE_ID`, `DISCORD_ADMIN_USER_IDS` | empty | Admins: may use `/löschen` and approve or decline requests in Discord; both empty = both off |
+| `DISCORD_APPROVAL_CHANNEL_ID` | the bot's channel | Where requests waiting for approval are posted with buttons |
 | `MIN_FREE_GB` | `15` | Refuse new requests and warn below this much free space |
+| `REQUEST_LIMIT`, `REQUEST_LIMIT_DAYS` | `0`, `7` | At most this many requests per person in this many days; `0` = no limit. Admins have none |
+| `MOVIE_PROFILES`, `TV_PROFILES` | empty | Radarr/Sonarr quality profiles to choose from, by name, e.g. `HD-1080p,Ultra-HD`; the first is preselected |
+| `WEEKLY_DIGEST` | empty | Post what's new every week, e.g. `sun 18:00` or `so 18:00`; empty = off |
+| `TIMEZONE` | `UTC` | For the weekly post and dates, e.g. `Europe/Zurich` |
+| `JELLYFIN_URL` | empty | Jellyfin's address for the *Jetzt ansehen* buttons; empty = the one Seerr uses |
+| `DATA_DIR` | `data` (`/data` in Docker) | Where `state.json` is kept |
 | `SEERR_URL` | `http://localhost:5055` | How the bot reaches Seerr |
 | `SEERR_API_KEY` | – | Seerr API key |
 | `SEERR_LANGUAGE` | `de` | Language of titles and descriptions |
@@ -111,6 +150,9 @@ python -m bot
   request role.
 - The container runs as an unprivileged user and needs no ports.
 - `/löschen` removes files for good. Only the admins you list can use it, and it always asks twice.
+- Approve and decline buttons check on every click that the person is an admin.
+- The bot only ever mentions the person who made a request, never `@everyone` or roles.
+- `state.json` holds Discord user IDs and display names of people who requested something, nothing else.
 
 ## Deleting and hardlinks
 
@@ -129,7 +171,10 @@ that removes finished torrents, or remove them by hand, so `/löschen` really fr
 | „Bitte im #kanal benutzen.“ | The bot only answers in `DISCORD_CHANNEL_ID`. |
 | „Seerr lehnt den API-Key ab“ | Wrong `SEERR_API_KEY`, or it was regenerated in Seerr. |
 | Requests are refused because of space | Less than `MIN_FREE_GB` is free in Radarr's or Sonarr's root folder. Free some space (see [Deleting and hardlinks](#deleting-and-hardlinks)) or lower the value. |
-| `/löschen` says deleting is off | Set `DISCORD_ADMIN_USER_IDS` or `DISCORD_ADMIN_ROLE_ID`. |
+| `/löschen` says deleting is off, or no approval buttons appear | Set `DISCORD_ADMIN_USER_IDS` or `DISCORD_ADMIN_ROLE_ID`. Buttons only appear for requests that really wait for approval (not for auto-approved ones). |
+| Nobody is told when something is there | That only works for requests made through the bot, and the bot must keep its `state.json` (Docker: the `seerrbot-data` volume). Check the log for `Could not save`. |
+| No quality choice appears | The names in `MOVIE_PROFILES`/`TV_PROFILES` must match profiles in Radarr/Sonarr; the log lists the ones it didn't find. With only one name there is nothing to choose, it is just used. |
+| The *Jetzt ansehen* button opens an address nobody can reach | Set `JELLYFIN_URL` to Jellyfin's address as people open it. |
 
 Logs: `docker logs --tail 50 seerrbot`.
 
@@ -140,7 +185,8 @@ python -m unittest discover -s tests -v
 ```
 
 The tests cover everything except the Discord layer: parsing Seerr's answers, seasons, status texts,
-requests and errors, with a fake Seerr and no network. They need no extra packages.
+requests, approvals, issues, the limit, the weekly post, the state file and errors, with a fake Seerr and
+no network. They need no extra packages.
 
 ## License
 

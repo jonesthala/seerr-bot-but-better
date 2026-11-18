@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any
 
 POSTER_BASE = "https://image.tmdb.org/t/p/w342"
@@ -17,13 +18,20 @@ SPACE_MARGIN = 2 * GB  # "enough space again" only this far above the minimum, s
 # Availability of a movie, show or season in Seerr (MediaInfo.status)
 UNKNOWN, PENDING, PROCESSING, PARTIAL, AVAILABLE, DELETED = 1, 2, 3, 4, 5, 6
 # Status of a request (MediaRequest.status)
-REQUEST_PENDING, REQUEST_APPROVED, REQUEST_DECLINED = 1, 2, 3
+REQUEST_PENDING, REQUEST_APPROVED, REQUEST_DECLINED, REQUEST_FAILED, REQUEST_COMPLETED = 1, 2, 3, 4, 5
+
+# Seerr's issue types, as offered by /problem
+ISSUE_TYPES = {1: "Bild", 2: "Ton", 3: "Untertitel", 4: "Anderes"}
 
 _YEAR_RE = re.compile(r"^(\d{4})")
 
 
 class SeerrError(Exception):
     """An error whose message can be shown to Discord users as it is."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status  # HTTP status from Seerr, None if Seerr wasn't reached
 
 
 @dataclass(frozen=True)
@@ -260,6 +268,33 @@ def shorten(text: str, limit: int) -> str:
     return cut + "…"
 
 
+def parse_time(value: Any) -> datetime | None:
+    """An ISO time from Seerr ('2026-11-18T10:00:00.000Z') as an aware datetime."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+def eta_text(eta: datetime | None, now: datetime) -> str:
+    """'noch ca. 20 Min.' for a download that should be done at eta; '' if unknown."""
+    if eta is None:
+        return ""
+    minutes = (eta - now).total_seconds() / 60
+    if minutes < 1:
+        return "gleich fertig"
+    if minutes < 60:
+        return f"noch ca. {round(minutes)} Min."
+    hours = minutes / 60
+    if hours < 24:
+        return f"noch ca. {max(1, round(hours))} Std."
+    days = round(hours / 24)
+    return f"noch ca. {days} Tag" if days == 1 else f"noch ca. {days} Tage"
+
+
 @dataclass(frozen=True)
 class OpenRequest:
     kind: str
@@ -268,16 +303,22 @@ class OpenRequest:
     media_status: int
     requested_by: str
     progress: int | None  # percent downloaded, None if nothing is downloading
+    request_id: int | None = None
+    eta: datetime | None = None  # when the download should be done
 
-    def line(self, name: str) -> str:
+    def line(self, name: str, who: str | None = None, now: datetime | None = None) -> str:
+        """One line for /status; who replaces Seerr's requester (the Discord name the bot remembered)."""
         if self.request_status == REQUEST_PENDING:
             state = "⏳ wartet auf Freigabe"
         elif self.progress is not None:
             state = f"⬇️ wird geladen, {self.progress} %"
+            rest = eta_text(self.eta, now or datetime.now(timezone.utc))
+            if rest:
+                state += f", {rest}"
         else:
             state = "🔎 wird gesucht"
-        who = f" · von {self.requested_by}" if self.requested_by else ""
-        return f"**{name}** · {state}{who}"
+        who = who or self.requested_by
+        return f"**{name}** · {state}" + (f" · von {who}" if who else "")
 
 
 def _display_name(user: Any) -> str:
@@ -298,6 +339,13 @@ def _progress(media: dict) -> int | None:
     if total <= 0:
         return None
     return max(0, min(100, round(100 * (total - left) / total)))
+
+
+def _eta(media: dict) -> datetime | None:
+    """When all running downloads should be done (the latest estimate)."""
+    times = [parse_time(d.get("estimatedCompletionTime")) for d in media.get("downloadStatus") or [] if isinstance(d, dict)]
+    known = [moment for moment in times if moment is not None]
+    return max(known) if known else None
 
 
 def open_requests(data: Any) -> list[OpenRequest]:
@@ -322,8 +370,207 @@ def open_requests(data: Any) -> list[OpenRequest]:
             media_status=status,
             requested_by=_display_name(item.get("requestedBy")),
             progress=_progress(media),
+            request_id=item.get("id") if isinstance(item.get("id"), int) else None,
+            eta=_eta(media),
         ))
     return found
+
+
+# --- single requests: approval and "it's there" -----------------------------------
+@dataclass(frozen=True)
+class Requested:
+    """What POST /request answered."""
+    status: int
+    request_id: int | None
+
+
+@dataclass(frozen=True)
+class RequestState:
+    request_id: int
+    kind: str
+    tmdb_id: int
+    status: int  # request status (REQUEST_*)
+    media_status: int  # availability (AVAILABLE etc.)
+    media_url: str | None  # link to it in Jellyfin/Plex, once Seerr knows one
+    seasons: tuple[int, ...]  # requested seasons of a show
+    requested_by: str
+
+
+def request_state(item: Any) -> RequestState | None:
+    """A request from GET /request or GET /request/{id}; None for anything unusable."""
+    if not isinstance(item, dict) or not isinstance(item.get("id"), int) or not isinstance(item.get("media"), dict):
+        return None
+    media = item["media"]
+    kind = item.get("type") or media.get("mediaType")
+    if kind not in ("movie", "tv") or not isinstance(media.get("tmdbId"), int):
+        return None
+    status = item.get("status") if isinstance(item.get("status"), int) else REQUEST_PENDING
+    media_status = media.get("status") if isinstance(media.get("status"), int) else UNKNOWN
+    url = media.get("mediaUrl")
+    seasons = sorted({
+        entry["seasonNumber"] for entry in item.get("seasons") or []
+        if isinstance(entry, dict) and isinstance(entry.get("seasonNumber"), int)
+    })
+    return RequestState(
+        request_id=item["id"],
+        kind=kind,
+        tmdb_id=media["tmdbId"],
+        status=status,
+        media_status=media_status,
+        media_url=url if isinstance(url, str) and url.startswith(("http://", "https://")) else None,
+        seasons=tuple(seasons),
+        requested_by=_display_name(item.get("requestedBy")),
+    )
+
+
+def pending_requests(data: Any) -> list[RequestState]:
+    results = data.get("results") if isinstance(data, dict) else None
+    states = [request_state(item) for item in results] if isinstance(results, list) else []
+    return [state for state in states if state is not None and state.status == REQUEST_PENDING]
+
+
+def seasons_done(title: Title, wanted: tuple[int, ...]) -> bool:
+    """All wanted seasons of a show are in the library."""
+    status = {season.number: season.status for season in title.seasons}
+    return bool(wanted) and all(status.get(number) == AVAILABLE for number in wanted)
+
+
+def what_text(name: str, kind: str, seasons: tuple[int, ...] | list[int]) -> str:
+    """'**Loki (2021)**, Staffel 1–2'"""
+    text = f"**{name}**"
+    if kind == "tv" and seasons:
+        text += f", Staffel {format_numbers(list(seasons))}"
+    return text
+
+
+def approval_text(name: str, kind: str, seasons: tuple[int, ...], who: str) -> str:
+    by = f" von {who}" if who else ""
+    return f"📥 Neue Anfrage{by}: {what_text(name, kind, seasons)}. Wartet auf Freigabe."
+
+
+def done_text(mention: str, name: str) -> str:
+    return f"🍿 {mention} **{name}** ist jetzt da. Viel Spass!"
+
+
+def declined_text(mention: str, name: str) -> str:
+    return f"❌ {mention} Deine Anfrage für **{name}** wurde abgelehnt."
+
+
+def failed_text(mention: str, name: str) -> str:
+    return f"⚠️ {mention} **{name}** konnte nicht an Radarr/Sonarr übergeben werden. Ein Admin schaut es sich an."
+
+
+# --- limit per person ------------------------------------------------------------------
+def next_allowed(times: list[float], limit: int, days: int, now: float) -> float | None:
+    """None if one more request is allowed now; otherwise when the next one is (epoch seconds)."""
+    if limit <= 0:
+        return None
+    window = days * 86400
+    recent = sorted(moment for moment in times if now - moment < window)
+    if len(recent) < limit:
+        return None
+    return recent[len(recent) - limit] + window
+
+
+def limit_text(limit: int, days: int, until: datetime) -> str:
+    what = "eine Anfrage" if limit == 1 else f"{limit} Anfragen"
+    return (
+        f"🚦 Pro Person gehen {what} in {days} Tagen, und die hast du schon gestellt. "
+        f"Die nächste geht wieder ab {until:%d.%m. um %H:%M}."
+    )
+
+
+# --- new in the library and the weekly digest ---------------------------------------------
+@dataclass(frozen=True)
+class NewMedia:
+    kind: str
+    tmdb_id: int
+    added: datetime | None
+    url: str | None
+
+
+def new_media(data: Any) -> list[NewMedia]:
+    """Items of a GET /media answer, in Seerr's order."""
+    results = data.get("results") if isinstance(data, dict) else None
+    items = []
+    for item in results if isinstance(results, list) else []:
+        if not isinstance(item, dict) or item.get("mediaType") not in ("movie", "tv") \
+                or not isinstance(item.get("tmdbId"), int):
+            continue
+        url = item.get("mediaUrl")
+        items.append(NewMedia(
+            kind=item["mediaType"],
+            tmdb_id=item["tmdbId"],
+            added=parse_time(item.get("mediaAddedAt")),
+            url=url if isinstance(url, str) and url.startswith(("http://", "https://")) else None,
+        ))
+    return items
+
+
+def new_line(item: NewMedia, name: str, zone: tzinfo) -> str:
+    icon = "🎬" if item.kind == "movie" else "📺"
+    safe = name.replace("[", "(").replace("]", ")")
+    shown = f"[{safe}]({item.url})" if item.url else f"**{safe}**"
+    date = f" · {item.added.astimezone(zone):%d.%m.}" if item.added else ""
+    return f"{icon} {shown}{date}"
+
+
+_WEEKDAYS = {
+    "mo": 0, "mon": 0, "di": 1, "tue": 1, "mi": 2, "wed": 2, "do": 3, "thu": 3,
+    "fr": 4, "fri": 4, "sa": 5, "sat": 5, "so": 6, "sun": 6,
+}
+_DIGEST_RE = re.compile(r"^([a-z]{2,3})\s+(\d{1,2}):(\d{2})$")
+
+
+def parse_digest(spec: str) -> tuple[int, int, int] | None:
+    """'sun 18:00' or 'so 18:00' → (6, 18, 0); '' → None (off). Raises ValueError for anything else."""
+    text = spec.strip().lower()
+    if not text:
+        return None
+    match = _DIGEST_RE.match(text)
+    if not match or match.group(1) not in _WEEKDAYS:
+        raise ValueError(spec)
+    hour, minute = int(match.group(2)), int(match.group(3))
+    if hour > 23 or minute > 59:
+        raise ValueError(spec)
+    return _WEEKDAYS[match.group(1)], hour, minute
+
+
+def digest_key(now: datetime, schedule: tuple[int, int, int]) -> str | None:
+    """This week's key ('2026-W47') once the scheduled time has passed this week, else None."""
+    if (now.weekday(), now.hour, now.minute) < schedule:
+        return None
+    year, week, _ = now.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def added_since(items: list[NewMedia], since: datetime) -> list[NewMedia]:
+    return [item for item in items if item.added is not None and item.added >= since]
+
+
+# --- trending and quality profiles -------------------------------------------------------
+def trending_results(data: Any, kind: str | None, limit: int = 10) -> list[Title]:
+    """Movies and shows from GET /discover/trending (people are skipped)."""
+    results = data.get("results") if isinstance(data, dict) else None
+    titles: list[Title] = []
+    for item in results if isinstance(results, list) else []:
+        if isinstance(item, dict) and (kind is None or item.get("mediaType") == kind):
+            title = title_from(item)
+            if title is not None:
+                titles.append(title)
+        if len(titles) == limit:
+            break
+    return titles
+
+
+def pick_profiles(details: Any, wanted: list[str]) -> list[tuple[int, str]]:
+    """The quality profiles named in wanted (any case), in that order, as (id, name)."""
+    profiles = details.get("profiles") if isinstance(details, dict) else None
+    by_name = {
+        str(p["name"]).strip().lower(): (p["id"], str(p["name"]).strip())
+        for p in profiles if isinstance(p, dict) and isinstance(p.get("id"), int) and isinstance(p.get("name"), str)
+    } if isinstance(profiles, list) else {}
+    return [by_name[name.strip().lower()] for name in wanted if name.strip().lower() in by_name]
 
 
 def deleted_text(title: Title) -> str:
@@ -334,8 +581,10 @@ def deleted_text(title: Title) -> str:
     )
 
 
-def request_done_text(kind: str, request_status: int) -> str:
+def request_done_text(kind: str, request_status: int, notify: bool = False) -> str:
+    """The answer under a request; notify: the bot will say here when it's there."""
     what = "Der Film" if kind == "movie" else "Die Serie"
-    if request_status == REQUEST_APPROVED:
-        return f"✅ Angefragt! {what} wird jetzt gesucht und geladen. Sobald alles da ist, taucht es in Jellyfin auf."
-    return f"⏳ Angefragt! {what} wartet noch auf die Freigabe in Seerr."
+    then = " Ich sage dir hier Bescheid, sobald alles da ist." if notify else " Sobald alles da ist, taucht es in Jellyfin auf."
+    if request_status == REQUEST_PENDING:
+        return f"⏳ Angefragt! {what} wartet noch auf die Freigabe durch einen Admin.{then}"
+    return f"✅ Angefragt! {what} wird jetzt gesucht und geladen.{then}"

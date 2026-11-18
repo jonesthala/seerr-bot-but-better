@@ -1,1 +1,2 @@
 discord.py>=2.4,<3
+tzdata  # time zones for TIMEZONE in the slim Docker image
