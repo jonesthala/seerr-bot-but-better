@@ -204,11 +204,12 @@ class JellyfinClient:
         files = [i for i in found or [] if isinstance(i, dict)]
         return [rate for u in library_usage(files, [], {}) if (rate := u.gb_per_hour) is not None]
 
-    def series_list(self) -> list[tuple[str, str]]:
-        """(Jellyfin id, 'Name (Jahr)') of every show in the library, by name (for /abo)."""
-        data = self._call("GET", "/Items", {"Recursive": "true", "IncludeItemTypes": "Series", "SortBy": "SortName"})
+    def series_list(self) -> list[tuple[str, str, int | None]]:
+        """(Jellyfin id, 'Name (Jahr)', TMDB id) of every show in the library, by name (for /abo)."""
+        data = self._call("GET", "/Items", {"Recursive": "true", "IncludeItemTypes": "Series", "SortBy": "SortName",
+                                           "Fields": "ProviderIds"})
         found = data.get("Items") if isinstance(data, dict) else None
-        return [(str(s["Id"]), _label(s)) for s in found or [] if isinstance(s, dict) and s.get("Id")]
+        return [(str(s["Id"]), _label(s), _tmdb(s)) for s in found or [] if isinstance(s, dict) and s.get("Id")]
 
     def episodes(self, series_id: str) -> dict[str, str]:
         """'S01E05' → episode title, for every episode of a show that is in the library."""

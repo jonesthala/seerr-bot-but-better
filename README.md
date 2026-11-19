@@ -41,7 +41,10 @@ to Radarr or Sonarr as usual.
 - **"It's there."** The bot remembers who requested what and mentions them when it is in the library,
   with a *Jetzt ansehen* button to Jellyfin. Also when a request was declined.
 - **`/status`**: requests waiting for approval, what is being searched or downloaded (with progress and
-  time left), who asked for it, and free space.
+  time left), who asked for it, and free space. With Sonarr/Radarr (setup step 5) per title: episodes there,
+  downloading, missing (which ones) and still to come, each download with a progress bar, time left and, with
+  qBittorrent, speed and sources; stuck downloads with the reason; whether a search is running. A button
+  refreshes it. Who requests a show gets an automatic `/abo` for it, so new episodes arrive as DM.
 - **`/neu`**: what came into the library last, with links. Optionally as a **weekly post** in the channel.
 - **`/problem <titel>`**: report a problem (picture, sound, subtitles, other) as an issue in Seerr.
 - **`/hilfe`**: the commands this person may use, each with an example. Admin commands only for admins.

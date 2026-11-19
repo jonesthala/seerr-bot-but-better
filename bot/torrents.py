@@ -11,18 +11,18 @@ import logging
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Callable
+from typing import Callable
 
-from .seerr import MAX_BYTES, USER_AGENT, Fetch, http_fetch
+from .arr import ArrClient, ArrError
+from .seerr import MAX_BYTES, USER_AGENT
 
 log = logging.getLogger("seerrbot.torrents")
 
 # (method, url, headers, body) → (HTTP status, lower-case response headers, raw body)
 RawFetch = Callable[[str, str, dict[str, str], bytes | None], tuple[int, dict[str, str], bytes]]
 
-
-class TorrentError(Exception):
-    """An error whose message can be shown to Discord users as it is."""
+TorrentError = ArrError  # one error type for Sonarr/Radarr and qBittorrent, shown to Discord users as it is
+__all__ = ["ArrClient", "QbitClient", "TorrentCleaner", "TorrentError", "raw_fetch"]
 
 
 def raw_fetch(method: str, url: str, headers: dict[str, str], body: bytes | None,
@@ -34,43 +34,6 @@ def raw_fetch(method: str, url: str, headers: dict[str, str], body: bytes | None
     except urllib.error.HTTPError as error:
         with error:
             return error.code, {k.lower(): v for k, v in error.headers.items()}, error.read(MAX_BYTES)
-
-
-class ArrClient:
-    """Sonarr (kind "tv") or Radarr (kind "movie"): only reads which downloads belonged to a title."""
-
-    def __init__(self, base_url: str, api_key: str, kind: str, fetch: Fetch = http_fetch) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
-        self.kind = kind
-        self.name = "Sonarr" if kind == "tv" else "Radarr"
-        self._fetch = fetch
-
-    def _get(self, path: str, query: dict[str, Any] | None = None) -> Any:
-        url = f"{self.base_url}/api/v3{path}" + ("?" + urllib.parse.urlencode(query) if query else "")
-        headers = {"X-Api-Key": self.api_key, "Accept": "application/json", "User-Agent": USER_AGENT}
-        try:
-            status, data = self._fetch("GET", url, headers, None)
-        except Exception as exc:  # noqa: BLE001 - timeouts, refused
-            log.warning("%s %s failed: %s", self.name, path, exc)
-            raise TorrentError(f"{self.name} ist nicht erreichbar, darum weiss ich nicht, welche Torrents dazugehören.") from exc
-        if status == 401:
-            raise TorrentError(f"{self.name} lehnt den API-Key ab. Ein Admin muss ihn prüfen.")
-        if not 200 <= status < 300:
-            raise TorrentError(f"{self.name} meldet einen Fehler (HTTP {status}).")
-        return data
-
-    def download_ids(self, tmdb_id: int) -> list[str]:
-        """Torrent hashes of everything ever downloaded for this title (lower case, without duplicates)."""
-        if self.kind == "movie":
-            found = self._get("/movie", {"tmdbId": tmdb_id})
-            ids = [m["id"] for m in found or [] if isinstance(m, dict) and m.get("tmdbId") == tmdb_id]
-            history = [h for i in ids for h in self._get("/history/movie", {"movieId": i}) or []]
-        else:
-            found = self._get("/series")
-            ids = [s["id"] for s in found or [] if isinstance(s, dict) and s.get("tmdbId") == tmdb_id]
-            history = [h for i in ids for h in self._get("/history/series", {"seriesId": i}) or []]
-        return sorted({str(h["downloadId"]).lower() for h in history if isinstance(h, dict) and h.get("downloadId")})
 
 
 class QbitClient:

@@ -86,6 +86,8 @@ class Store:
         self.abos: dict[int, list[str]] = {}
         self.abo_names: dict[str, str] = {}
         self.abo_known: dict[str, list[str]] = {}
+        # automatic abos for show requests whose show is not in Jellyfin yet: TMDB id → (Discord users, since when)
+        self.pending_abos: dict[int, tuple[list[int], float]] = {}
         self.digest = ""
         self._load()
 
@@ -113,6 +115,9 @@ class Store:
         self.abo_names = {str(k): str(v) for k, v in names.items()} if isinstance(names, dict) else {}
         self.abo_known = {str(k): [str(e) for e in v] for k, v in known.items() if isinstance(v, list)} \
             if isinstance(known, dict) else {}
+        pending = abos.get("pending") if isinstance(abos.get("pending"), dict) else {}
+        self.pending_abos = {int(k): ([int(u) for u in v.get("users", []) if str(u).isdigit()], float(v.get("since") or 0))
+                             for k, v in pending.items() if str(k).isdigit() and isinstance(v, dict)}
         self.digest = str(data.get("digest") or "")
 
     def save(self) -> None:
@@ -123,7 +128,8 @@ class Store:
             "requests": [asdict(t) for t in self.requests.values()],
             "approvals": [asdict(a) for a in self.approvals.values()],
             "friends": [asdict(f) for f in self.friends.values()],
-            "abos": {"users": {str(k): v for k, v in self.abos.items()}, "names": self.abo_names, "known": self.abo_known},
+            "abos": {"users": {str(k): v for k, v in self.abos.items()}, "names": self.abo_names, "known": self.abo_known,
+                     "pending": {str(k): {"users": users, "since": since} for k, (users, since) in self.pending_abos.items()}},
             "digest": self.digest,
         }
         tmp = None
@@ -225,6 +231,32 @@ class Store:
             self.abo_known[series_id] = sorted(known)
         self.save()
         return True
+
+    def subscribe(self, user_id: int, series_id: str, name: str, known: list[str]) -> None:
+        """Like toggle_abo, but never unsubscribes (for the automatic abo after a request)."""
+        if series_id not in self.abos.get(user_id, []):
+            self.toggle_abo(user_id, series_id, name, known)
+
+    def add_pending_abo(self, tmdb_id: int, user_id: int) -> None:
+        users, since = self.pending_abos.get(tmdb_id, ([], self._now()))
+        if user_id not in users:
+            users.append(user_id)
+        self.pending_abos[tmdb_id] = (users, since)
+        self.save()
+
+    def take_pending_abos(self, tmdb_id: int) -> list[int]:
+        users, _ = self.pending_abos.pop(tmdb_id, ([], 0.0))
+        self.save()
+        return users
+
+    def drop_old_pending_abos(self, days: int = 30) -> None:
+        """A request that was declined never shows up in Jellyfin; forget it after a while."""
+        cutoff = self._now() - days * 86400
+        old = [k for k, (_, since) in self.pending_abos.items() if since < cutoff]
+        for key in old:
+            del self.pending_abos[key]
+        if old:
+            self.save()
 
     def user_abos(self, user_id: int) -> list[str]:
         return list(self.abos.get(user_id, []))

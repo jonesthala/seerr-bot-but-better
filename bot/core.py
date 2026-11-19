@@ -320,6 +320,11 @@ class OpenRequest:
 
     def line(self, name: str, who: str | None = None, now: datetime | None = None) -> str:
         """One line for /status; who replaces Seerr's requester (the Discord name the bot remembered)."""
+        who = who or self.requested_by
+        return f"**{name}** · {self.state(now)}" + (f" · von {who}" if who else "")
+
+    def state(self, now: datetime | None = None) -> str:
+        """What Seerr knows: waiting for approval, downloading (with progress), partly there or being searched."""
         if self.request_status == REQUEST_PENDING:
             state = "⏳ wartet auf Freigabe"
         elif self.progress is not None:
@@ -333,8 +338,7 @@ class OpenRequest:
             state = "🟡 teilweise da, der Rest wird gesucht"
         else:
             state = "🔎 wird gesucht"
-        who = who or self.requested_by
-        return f"**{name}** · {state}" + (f" · von {who}" if who else "")
+        return state
 
 
 def _display_name(user: Any) -> str:

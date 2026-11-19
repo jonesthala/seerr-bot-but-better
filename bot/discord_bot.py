@@ -6,7 +6,7 @@ import dataclasses
 import logging
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import discord
@@ -59,7 +59,8 @@ from .jellyfin import (
     welcome_text,
 )
 from .seerr import SeerrClient
-from .torrents import TorrentCleaner, TorrentError
+from .arr import ArrClient, ArrError, Progress, progress_lines
+from .torrents import QbitClient, TorrentCleaner, TorrentError
 from .store import FRIEND_APPROVED, FRIEND_DECLINED, FRIEND_PENDING, FRIEND_REVOKED, Approval, Friend, Store
 
 log = logging.getLogger("seerrbot.discord")
@@ -131,7 +132,7 @@ async def report_error(interaction: discord.Interaction, error: BaseException) -
         message = str(error)
     elif isinstance(error, app_commands.CheckFailure):
         message = "🔒 Das darfst du hier nicht."
-    elif isinstance(error, (SeerrError, JellyfinError, TorrentError)):
+    elif isinstance(error, (SeerrError, JellyfinError, TorrentError, ArrError)):
         message = f"⚠️ {error}"
     else:
         log.error("Interaction failed", exc_info=error)
@@ -164,7 +165,8 @@ class GuardedTree(app_commands.CommandTree):
 
 class SeerrBot(discord.Client):
     def __init__(self, settings: Settings, seerr: SeerrClient, store: Store | None = None,
-                 jellyfin: JellyfinClient | None = None, torrents: TorrentCleaner | None = None) -> None:
+                 jellyfin: JellyfinClient | None = None, torrents: TorrentCleaner | None = None,
+                 arrs: dict[str, ArrClient] | None = None, qbit: QbitClient | None = None) -> None:
         intents = discord.Intents.none()
         intents.guilds = True
         # Only the requester may be pinged, never @everyone or roles (titles come from TMDB).
@@ -174,6 +176,8 @@ class SeerrBot(discord.Client):
         self.seerr = seerr
         self.jellyfin = jellyfin  # None: /jellyfin-zugang is not set up
         self.torrents = torrents  # None: /löschen leaves the torrents in qBittorrent
+        self.arrs = arrs or {}  # "tv" → Sonarr, "movie" → Radarr: details in /status
+        self.qbit = qbit  # speed and sources of running downloads in /status
         self.store = store if store is not None else Store(settings.data_dir or None)
         self.tree = GuardedTree(self)
         self.space = SpaceWatch(settings.min_free_gb * GB)
@@ -181,7 +185,8 @@ class SeerrBot(discord.Client):
         self._approval_lock = asyncio.Lock()
         self._friend_lock = asyncio.Lock()
         self.login_clicks: dict[int, float] = {}  # Discord user → when the last password was made
-        self._series: tuple[float, list[tuple[str, str]]] = (0.0, [])  # (when loaded, shows) for /abo
+        self._series: tuple[float, list[tuple[str, str, int | None]]] = (0.0, [])  # (when loaded, shows) for /abo
+        self.status_clicks: dict[int, float] = {}  # status message → last refresh
         self._rate: tuple[float, SizeRate] = (0.0, RULE_OF_THUMB)  # (when measured, GB per hour)
         self._background: set[asyncio.Task] = set()
 
@@ -190,7 +195,7 @@ class SeerrBot(discord.Client):
         for command in build_commands(self):
             self.tree.add_command(command, guild=guild)
         await self.tree.sync(guild=guild)
-        self.add_dynamic_items(ApprovalButton, FriendButton, LoginButton)  # buttons keep working after a restart
+        self.add_dynamic_items(ApprovalButton, FriendButton, LoginButton, StatusRefresh)  # work after a restart
         await self.load_profiles()
         self.space_loop.start()
         self.watch_loop.start()
@@ -315,8 +320,8 @@ class SeerrBot(discord.Client):
     async def _wait_until_ready(self) -> None:
         await self.wait_until_ready()
 
-    async def series_list(self) -> list[tuple[str, str]]:
-        """The shows in Jellyfin, (id, 'Name (Jahr)'), reloaded every few minutes."""
+    async def series_list(self) -> list[tuple[str, str, int | None]]:
+        """The shows in Jellyfin, (id, 'Name (Jahr)', TMDB id), reloaded every few minutes."""
         loaded, shows = self._series
         if self.jellyfin is not None and (not shows or time.monotonic() - loaded > SERIES_CACHE_SECONDS):
             shows = await asyncio.to_thread(self.jellyfin.series_list)
@@ -338,6 +343,7 @@ class SeerrBot(discord.Client):
         """Tells subscribers about episodes that came into Jellyfin since the last check."""
         if self.jellyfin is None:
             return
+        await self.resolve_pending_abos()
         for series_id in self.store.subscribed_series():
             try:
                 present = await asyncio.to_thread(self.jellyfin.episodes, series_id)
@@ -353,6 +359,74 @@ class SeerrBot(discord.Client):
             text = new_episodes_text(name, {key: escape(present[key]) for key in new})
             for user_id in self.store.subscribers(series_id):
                 await self.tell(user_id, text)
+
+    async def auto_abo(self, user_id: int, title: Title) -> str:
+        """After a show request: subscribe the requester, so new episodes arrive as DM. Returns the note for them."""
+        if self.jellyfin is None or title.kind != "tv":
+            return ""
+        try:
+            show = next((s for s in await self.series_list() if s[2] == title.tmdb_id), None)
+            if show is None:  # not in Jellyfin yet: subscribe as soon as it shows up
+                self.store.add_pending_abo(title.tmdb_id, user_id)
+            else:
+                present = await asyncio.to_thread(self.jellyfin.episodes, show[0])
+                self.store.subscribe(user_id, show[0], show[1], list(present))
+        except Exception:  # noqa: BLE001 - the request itself worked, the abo is a nice-to-have
+            log.warning("Automatic abo for %s failed", title.label)
+            return ""
+        return "📺 Sobald Folgen in Jellyfin sind, bekommst du eine DM (Abo, beenden mit `/abo`)."
+
+    async def resolve_pending_abos(self) -> None:
+        """Turns automatic abos into real ones once the requested show is in Jellyfin."""
+        self.store.drop_old_pending_abos()
+        if not self.store.pending_abos:
+            return
+        self._series = (0.0, self._series[1])  # look at Jellyfin now, not at the cached list
+        shows = {tmdb: (sid, label) for sid, label, tmdb in await self.series_list() if tmdb}
+        for tmdb_id in list(self.store.pending_abos):
+            if tmdb_id in shows:
+                sid, label = shows[tmdb_id]
+                for user_id in self.store.take_pending_abos(tmdb_id):
+                    self.store.subscribe(user_id, sid, label, [])  # everything there now is new for them
+
+    async def status_embed(self) -> discord.Embed:
+        """/status: per open request what Seerr knows, and with Sonarr/Radarr the episodes, downloads and searches."""
+        items = await asyncio.to_thread(self.seerr.open_requests)
+        free = await asyncio.to_thread(self.seerr.free_bytes)
+        now = datetime.now(timezone.utc)
+        details: dict[tuple[str, int], Progress] = {}
+        problems: list[str] = []
+        for kind, arr in self.arrs.items():
+            ids = [i.tmdb_id for i, _ in items if i.kind == kind and i.request_status != REQUEST_PENDING]
+            if ids:
+                try:
+                    found = await asyncio.to_thread(arr.progress, ids, now)
+                    details.update({(kind, tmdb_id): progress for tmdb_id, progress in found.items()})
+                except ArrError as error:
+                    problems.append(f"⚠️ {error}")
+        live: dict[str, dict] = {}
+        hashes = [d.hash for p in details.values() for d in p.downloads if d.hash and d.state == "downloading"]
+        if self.qbit is not None and hashes:
+            try:
+                live = {str(t.get("hash")).lower(): t for t in await asyncio.to_thread(self.qbit.torrents, hashes)}
+            except ArrError:
+                pass  # without speed and sources
+        embed = discord.Embed(title="Status", color=discord.Color.blurple())
+        for item, name in items[:25]:
+            tracked = self.store.request(item.request_id)
+            who = tracked.user_name if tracked else item.requested_by
+            progress = details.get((item.kind, item.tmdb_id))
+            lines = progress_lines(item.kind, progress, live, now) if progress else [item.state(now)]
+            embed.add_field(name=shorten(name + (f" · von {who}" if who else ""), 256),
+                            value="\n".join(lines)[:1024] or "–", inline=False)
+        head = [] if items else ["📭 Keine offenen Anfragen. Alles Angefragte ist schon da."]
+        if free is not None:
+            minimum = self.settings.min_free_gb * GB
+            head.append(f"💾 **Nur noch {size_text(free)} frei**, neue Anfragen sind gesperrt." if free < minimum
+                        else f"💾 Noch {size_text(free)} frei.")
+        embed.description = "\n".join(head + problems)
+        embed.set_footer(text=f"Stand {datetime.now(self.settings.zone):%H:%M} · 🔄 zum Aktualisieren klicken")
+        return embed
 
     async def sync_approvals(self) -> None:
         """Posts Approve/Decline buttons for new pending requests (also those made in Seerr itself)
@@ -483,6 +557,39 @@ async def handle_approval(interaction: discord.Interaction, request_id: int, act
     if action == "decline" and tracked is not None and not tracked.notified:
         await bot.post(declined_text(f"<@{tracked.user_id}>", escape(tracked.label)))
         bot.store.mark_notified(request_id)
+
+
+# --- /status refresh (persistent, anyone may click) ---------------------------------------------
+STATUS_COOLDOWN = 10  # seconds between two refreshes of the same message
+
+
+class StatusRefresh(discord.ui.DynamicItem[discord.ui.Button], template=r"status:refresh"):
+    def __init__(self) -> None:
+        super().__init__(discord.ui.Button(label="Aktualisieren", emoji="🔄", style=discord.ButtonStyle.secondary,
+                                           custom_id="status:refresh"))
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match[str]):
+        return cls()
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        bot: SeerrBot = interaction.client  # type: ignore[assignment]
+        key = interaction.message.id if interaction.message else 0
+        if time.monotonic() - bot.status_clicks.get(key, 0.0) < STATUS_COOLDOWN:
+            await interaction.response.send_message("⏳ Gerade eben aktualisiert.", ephemeral=True)
+            return
+        bot.status_clicks[key] = time.monotonic()
+        try:
+            await interaction.response.defer()
+            await interaction.edit_original_response(embed=await bot.status_embed(), view=status_view())
+        except Exception as error:  # noqa: BLE001 - shown to who clicked, details in the log
+            await report_error(interaction, error)
+
+
+def status_view() -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(StatusRefresh())
+    return view
 
 
 # --- Jellyfin accounts for friends (/jellyfin-zugang) -------------------------------------------
@@ -795,6 +902,9 @@ class RequestButton(discord.ui.Button):
             what += f" · {profile}"
         embed = title_embed(bot, title, footer=f"Angefragt von {interaction.user.display_name}: {what}")
         text = request_done_text(title.kind, result.status, notify=result.request_id is not None)
+        if result.request_id is not None:
+            note = await bot.auto_abo(interaction.user.id, title)
+            text += f"\n{note}" if note else ""
         embed.set_field_at(0, name="Status", value=text, inline=False)
         await interaction.edit_original_response(embed=embed, view=None)
         if result.status == REQUEST_PENDING:
@@ -1040,22 +1150,7 @@ def build_commands(bot: SeerrBot) -> list[app_commands.Command]:
     @app_commands.command(name="status", description="Offene Anfragen, was gerade geladen wird und wie viel Platz frei ist")
     async def status(interaction: discord.Interaction) -> None:
         await interaction.response.defer(thinking=True)
-        items = await asyncio.to_thread(bot.seerr.open_requests)
-        free = await asyncio.to_thread(bot.seerr.free_bytes)
-        lines = []
-        for item, name in items:
-            tracked = bot.store.request(item.request_id)
-            lines.append(item.line(escape(name), escape(tracked.user_name) if tracked else None))
-        if not lines:
-            lines.append("📭 Keine offenen Anfragen. Alles Angefragte ist schon da.")
-        if free is not None:
-            minimum = bot.settings.min_free_gb * GB
-            if free < minimum:
-                lines.append(f"\n💾 **Nur noch {size_text(free)} frei**, neue Anfragen sind gesperrt.")
-            else:
-                lines.append(f"\n💾 Noch {size_text(free)} frei.")
-        embed = discord.Embed(title="Status", description="\n".join(lines), color=discord.Color.blurple())
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(embed=await bot.status_embed(), view=status_view())
 
     @app_commands.command(name="problem", description="Ein Problem mit einem Film oder einer Serie melden")
     @app_commands.describe(
@@ -1211,7 +1306,7 @@ def friend_commands(bot: SeerrBot, requester) -> list[app_commands.Command]:
             return []
         text, mine = current.strip().casefold(), set(bot.store.user_abos(interaction.user.id))
         return [app_commands.Choice(name=shorten(("🔔 " if sid in mine else "") + label, 100), value=sid)
-                for sid, label in shows if text in label.casefold()][:25]
+                for sid, label, _ in shows if text in label.casefold()][:25]
 
     @app_commands.command(name="abo", description="Serie abonnieren: Du bekommst eine Nachricht, sobald neue Folgen da sind")
     @app_commands.describe(serie="Serie aus der Bibliothek. Nochmals wählen beendet das Abo. Leer lassen: deine Abos")
@@ -1226,7 +1321,7 @@ def friend_commands(bot: SeerrBot, requester) -> list[app_commands.Command]:
             await interaction.response.send_message(text, ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        shows = dict(await bot.series_list())
+        shows = {sid: label for sid, label, _ in await bot.series_list()}
         wanted = serie.strip().casefold()
         series_id = serie if serie in shows else next(
             (sid for sid, label in shows.items() if label.casefold().startswith(wanted)), None)
