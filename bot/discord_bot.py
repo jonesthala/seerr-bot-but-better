@@ -1561,7 +1561,7 @@ WEEKDAY_NAMES = ("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Sam
 def fetch_image(url: str) -> bytes | None:
     """A poster for the Discord event; None if it can't be loaded (the event works without)."""
     try:
-        request = urllib.request.Request(url, headers={"User-Agent": "seerr-discord-bot"})
+        request = urllib.request.Request(url, headers={"User-Agent": "seerr-bot-but-better"})
         with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310 (poster URL from Seerr/TMDB)
             data = response.read(8_000_001)
     except Exception:  # noqa: BLE001 - just no picture

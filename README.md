@@ -1,8 +1,10 @@
-# seerr-discord-bot
+# seerr bot but better
 
-Request movies and shows from Discord. The bot searches [Seerr](https://docs.seerr.dev), shows the
-poster and whether a title is already there, and requests it with one click. Seerr then hands it
-to Radarr or Sonarr as usual.
+Request movies and shows from Discord, and a bit more. The bot searches [Seerr](https://docs.seerr.dev), shows
+the poster and whether a title is already there, and requests it with one click; Seerr hands it to Radarr or
+Sonarr as usual. With Sonarr, Radarr, qBittorrent and Jellyfin connected (all optional) it also shows live
+download progress, follows shows episode by episode, has a calendar, cleans up after watching and keeps the
+disk from running full.
 
 ```text
 /film Sint…        (suggestions while you type: Sintel (2010) · Film · ➕ Noch nicht da …)
@@ -12,9 +14,16 @@ to Radarr or Sonarr as usual.
   📥 Neue Anfrage von alex: Sintel (2010). Wartet auf Freigabe.      [✅ Freigeben] [✖️ Ablehnen]
 
 /status
-  Sintel (2010) · ⬇️ wird geladen, 45 %, noch ca. 20 Min. · von alex
+  📺 One Piece (1999)   🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜  42 %   7.3 von 17.5 GB · 4.3 MB/s · fertig noch ca. 40 Min.
+  Lädt gerade: S23E01 🟦🟦🟦🟦🟦⬜⬜⬜ 63 % …   Pausiert: S23 Folge 13–17
 
   🍿 @alex Sintel (2010) ist jetzt da. Viel Spass!      [▶️ Jetzt ansehen]
+
+/verfolgen Dexter ab S02E04
+  📺 Dexter: Resurrection (2025) wird verfolgt, ab S02E04.
+  📅 Nächste Folge: Mo 23.11. um 02:00 (S02E04), danach 6 weitere bis Mo 04.01.
+
+  (DM) 👀 Geschaut: Dune (2021) · 4.9 GB. Löschen, damit Platz frei wird?      [🗑️ Löschen] [👍 Behalten]
 ```
 
 > The bot's messages are in German.
@@ -40,13 +49,14 @@ to Radarr or Sonarr as usual.
   *Freigeben* / *Ablehnen* buttons that only admins can use. Requests handled in Seerr update the message.
 - **"It's there."** The bot remembers who requested what and mentions them when it is in the library,
   with a *Jetzt ansehen* button to Jellyfin. Also when a request was declined.
-- **`/status`**: requests waiting for approval, what is being searched or downloaded (with progress and
-  time left), who asked for it, and free space. With Sonarr/Radarr (setup step 5) per title: episodes there,
+- **`/status`**: one card per title with poster and an overall progress bar: requests waiting for approval,
+  what is being searched or downloaded, who asked for it, and free space. With Sonarr/Radarr (setup step 5): episodes there,
   downloading, missing (which ones) and still to come, each download with a progress bar, time left and, with
   qBittorrent, speed and sources; stuck downloads with the reason; whether a search is running. A button
   refreshes it. Who requests a show gets an automatic `/abo` for it, so new episodes arrive as DM. Downloads
   without a request in Seerr (from `/folgen` or added in Sonarr/Radarr) get a card too.
-- **`/neu`**: what came into the library last, with links. Optionally as a **weekly post** in the channel.
+- **`/neu`**: what came into the library last, with links, shows that are only partly there marked as such
+  (e.g. „teilweise da (Staffel 23)“). Optionally as a **weekly post** in the channel.
 - **`/problem <titel>`**: report a problem (picture, sound, subtitles, other) as an issue in Seerr.
 - **`/hilfe`**: the commands this person may use, each with an example. Admin commands only for admins.
 - **`/abo <serie>`** (needs the Jellyfin setup below): subscribe to a show in the library and get a DM when new
@@ -85,7 +95,9 @@ to Radarr or Sonarr as usual.
   included, after a second confirmation click. It is reset in Seerr, so it can be requested again later.
   With qBittorrent access (setup step 5) it also removes the title's torrents with their files, so the space
   is really freed, and says how much. Afterwards Jellyfin reads its library again and, three minutes after the last
-  deletion, Seerr compares itself with it, so the title doesn't stay "available" in Seerr and `/neu`.
+  deletion, Seerr compares itself with it, so the title doesn't stay "available" in Seerr and `/neu`. Titles that
+  Sonarr/Radarr don't know (files that were in the library before) are not deleted: Seerr would say "deleted" and
+  leave the files, so the bot says so and names the folder to delete by hand.
 - **Only where it belongs.** The bot answers in one channel; optionally only members with a role may request.
 - **Your search, your buttons.** Only the person who searched can pick and request.
 
@@ -107,18 +119,23 @@ use `/folgen`, which talks to Sonarr directly.
 
 ```mermaid
 flowchart LR
-    D[Discord channel] -- /film, /serie, /status … --> B[Bot]
+    D[Discord channel and DMs] -- /film, /serie, /status … --> B[Bot]
     B -- REST API + API key --> S[Seerr]
     S --> R[Radarr / Sonarr]
-    B -. optional: /jellyfin-zugang .-> J[Jellyfin]
+    B -. optional: details, /folgen, /verfolgen, /kalender .-> R
+    B -. optional: torrents, download brake .-> Q[qBittorrent]
+    B -. optional: accounts, /zufall, watched .-> J[Jellyfin]
     B -. state.json .- V[(data volume)]
 ```
 
-The bot only talks to Discord, to Seerr's API and, if you set it up, to Jellyfin's API. Every two minutes it asks Seerr for new requests to
-approve and for finished downloads to announce. It keeps one small file, `state.json` in `DATA_DIR`
-(`/data` in Docker): who requested what through Discord, the approval messages it posted, the week
-of the last weekly post and who asked for a Jellyfin account. Without it the bot still works, but forgets
-that on a restart.
+The bot talks to Discord and Seerr's API, and to Sonarr, Radarr, qBittorrent and Jellyfin if you set them up.
+It looks on its own: every two minutes at Seerr for new requests to approve and finished downloads to announce,
+every minute at the free space (download brake), every five minutes at what was watched in Jellyfin, every ten
+minutes for new episodes of subscribed shows. It keeps one small file, `state.json` in `DATA_DIR` (`/data` in
+Docker): who requested what through Discord, the approval messages it posted, the week of the last weekly
+post, who asked for a Jellyfin account, the subscriptions and followed shows, the open "Geschaut, löschen?"
+questions and which torrents the download brake paused. Without it the bot still works, but forgets that on a
+restart.
 
 ## Setup
 
@@ -126,8 +143,9 @@ that on a restart.
 
 1. [Discord Developer Portal](https://discord.com/developers/applications) → **New Application** → **Bot** → **Reset Token**, copy it.
 2. **OAuth2 → URL Generator**: scopes `bot` and `applications.commands`; bot permissions
-   **View Channels**, **Send Messages**, **Embed Links**. Open the link and add the bot to your server.
-   No privileged intents are needed.
+   **View Channels**, **Send Messages**, **Embed Links**, and **Create Events** for `/filmabend`. Open the link
+   and add the bot to your server. No privileged intents are needed. Admins listed in `DISCORD_ADMIN_USER_IDS`
+   get DMs from the bot ("Geschaut, löschen?"), so they should allow DMs from server members.
 3. Discord → User Settings → Advanced → **Developer Mode** on. Right-click → **Copy ID** for the server,
    the channel and (optionally) the role that may request.
 
@@ -147,7 +165,7 @@ user the *Advanced Requests* permission in Seerr.
 ### 3. Run it
 
 ```bash
-git clone https://github.com/jonesthala/seerr-discord-bot.git seerrbot && cd seerrbot
+git clone https://github.com/jonesthala/seerr-bot-but-better.git seerrbot && cd seerrbot
 cp .env.example .env && chmod 600 .env    # fill in the values
 docker compose up -d --build
 ```
@@ -186,11 +204,16 @@ The three commands appear once all four required values are set. Taking access a
 account, so the person can't watch anything any more. The Tailscale share stays until you remove it in
 Tailscale (Machines → Jellyfin → Share); the bot has no Tailscale access.
 
-### 5. Remove the torrents too when deleting (optional)
+### 5. Sonarr, Radarr and qBittorrent (optional)
 
-With hardlinks, a deleted title keeps taking space while its torrent is still seeding. To remove the torrents
-as well, the bot needs to know which ones belong to the title (Sonarr's and Radarr's history) and to log in
-to qBittorrent (WebUI user and password; qBittorrent 4.x has no API keys):
+Seerr alone is enough for requesting. With direct access to Sonarr and Radarr (API keys from *Settings →
+General*) and qBittorrent (WebUI user and password; qBittorrent 4.x has no API keys) the bot also:
+
+- shows per title in `/status` which episodes are there, downloading or missing, with speed and time left;
+- `/folgen`, `/verfolgen` and `/kalender` (Sonarr);
+- removes a deleted title's torrents too, so the space is really freed (with hardlinks, a deleted title keeps
+  taking space while its torrent is still seeding), and deletes watched episodes ("Geschaut, löschen?");
+- pauses running downloads when the disk is nearly full (download brake, qBittorrent).
 
 ```env
 QBITTORRENT_URL=http://192.168.1.20:8080
@@ -204,6 +227,8 @@ RADARR_API_KEY=...
 
 Only torrents listed in the history of that title are removed, nothing else. If Sonarr/Radarr or qBittorrent
 can't be asked, nothing is deleted. Files you added by hand (not through Sonarr/Radarr) stay in qBittorrent.
+Each part works on its own: without qBittorrent there is no brake and torrents stay, without Radarr `/status`
+shows movies as Seerr sees them.
 
 Without Docker (Python 3.11 or newer):
 
@@ -221,7 +246,7 @@ python -m bot    # remembers its state in ./data unless DATA_DIR says otherwise
 | `DISCORD_TOKEN` | – | Bot token |
 | `DISCORD_GUILD_ID`, `DISCORD_CHANNEL_ID` | – | Server and channel the bot works in |
 | `DISCORD_REQUEST_ROLE_ID` | empty | Only this role may search and request; empty = everyone in the channel |
-| `DISCORD_ADMIN_ROLE_ID`, `DISCORD_ADMIN_USER_IDS` | empty | Admins: may use `/löschen` and approve or decline requests in Discord; both empty = both off |
+| `DISCORD_ADMIN_ROLE_ID`, `DISCORD_ADMIN_USER_IDS` | empty | Admins: `/löschen`, `/folgen`, `/speicher`, Jellyfin accounts, approving requests and `/verfolgen` of others; admins by user ID also get the "Geschaut, löschen?" DMs. Both empty = all of that off |
 | `DISCORD_APPROVAL_CHANNEL_ID` | the bot's channel | Where requests waiting for approval are posted with buttons |
 | `MIN_FREE_GB` | `15` | Refuse new requests and warn below this much free space |
 | `BRAKE_FREE_GB` | `3` | Pause running downloads in qBittorrent below this much free space; `0` = off |
@@ -236,8 +261,8 @@ python -m bot    # remembers its state in ./data unless DATA_DIR says otherwise
 | `TAILSCALE_SHARE_URL` | empty | `/jellyfin-zugang`: multi-use share link for the Jellyfin machine |
 | `JELLYFIN_FRIEND_LIBRARIES` | empty = all | Libraries friends may see, by name, e.g. `Movies,Shows` |
 | `JELLYFIN_FRIEND_BITRATE_MBIT` | `4` | Bitrate limit for friends streaming from outside; `0` = none |
-| `QBITTORRENT_URL`, `QBITTORRENT_USERNAME`, `QBITTORRENT_PASSWORD` | empty | `/löschen` also removes the torrents (with `SONARR_*` or `RADARR_*`) |
-| `SONARR_URL`, `SONARR_API_KEY`, `RADARR_URL`, `RADARR_API_KEY` | empty | Which torrents belong to a show or movie, details in `/status`; Sonarr also for `/folgen` (the only writes: monitor and search episodes) |
+| `QBITTORRENT_URL`, `QBITTORRENT_USERNAME`, `QBITTORRENT_PASSWORD` | empty | Speed in `/status`, removing torrents when deleting, the download brake |
+| `SONARR_URL`, `SONARR_API_KEY`, `RADARR_URL`, `RADARR_API_KEY` | empty | Details in `/status`, which torrents belong to a title; Sonarr also for `/folgen`, `/verfolgen`, `/kalender` and deleting watched episodes |
 | `DATA_DIR` | `data` (`/data` in Docker) | Where `state.json` is kept |
 | `SEERR_URL` | `http://localhost:5055` | How the bot reaches Seerr |
 | `SEERR_API_KEY` | – | Seerr API key |
@@ -257,7 +282,12 @@ python -m bot    # remembers its state in ./data unless DATA_DIR says otherwise
 - `state.json` holds Discord user IDs and display names of people who requested something, and for Jellyfin
   accounts the user name, the account ID and the state. Never a password.
 - With `QBITTORRENT_*` the bot can remove torrents and their files. It only ever removes those Sonarr/Radarr list
-  for the title an admin deletes. Sonarr and Radarr are only read.
+  for what an admin deletes. The download brake only pauses running downloads and later starts exactly those again.
+- What the bot changes in Sonarr: monitoring and searching episodes (`/folgen`, `/verfolgen`), adding a show
+  without its old episodes (`/verfolgen`), deleting the files of watched episodes after an admin clicks *Löschen*.
+  `/folgen` is for admins only; `/verfolgen` of others needs an admin's approval. Radarr is only changed through
+  Seerr (`/löschen`).
+- In Jellyfin the bot also starts a library scan after deleting; in Seerr its availability sync.
 - The Jellyfin API key can do everything an admin can. Friends' accounts are only created after an admin's
   click, and a password is only shown to the person whose button it is.
 
@@ -284,6 +314,11 @@ that removes finished torrents, or remove them by hand, so `/löschen` really fr
 | The *Jetzt ansehen* button opens an address nobody can reach | Set `JELLYFIN_URL` to Jellyfin's address as people open it. |
 | `/jellyfin-zugang` doesn't show up | All of `JELLYFIN_API_URL`, `JELLYFIN_API_KEY`, `JELLYFIN_FRIEND_URL`, `TAILSCALE_SHARE_URL` and an admin setting are needed. |
 | „Jellyfin lehnt den API-Schlüssel ab“ or „Diese Jellyfin-Bibliotheken gibt es nicht“ | Check `JELLYFIN_API_KEY`, and that the names in `JELLYFIN_FRIEND_LIBRARIES` match the libraries in Jellyfin. |
+| `/filmabend`: „Dem Bot fehlt die Berechtigung Events erstellen“ | Give the bot's role *Create Events* (Server Settings → Roles). |
+| No "Geschaut, löschen?" DMs | Needs Jellyfin, admins and `WATCHED_ASK` not `0`. Only what is watched to the end after the bot started counts. Admins by role only (no user IDs) get the question in the approval channel. The admin must allow DMs from server members. |
+| `/verfolgen`: „Sonarr findet diese Serie nicht“ | The show has no TVDB id on TMDB yet, so Sonarr can't add it. Try again later or add it in Sonarr by hand, then `/verfolgen` works. |
+| `/folgen`, `/verfolgen`, `/kalender` don't show up | They need `SONARR_URL` and `SONARR_API_KEY`. |
+| Downloads stay paused | The download brake: less than `BRAKE_FREE_GB` is free. They start again by themselves at 2 GB more; free some space, or set `BRAKE_FREE_GB=0`. |
 
 Logs: `docker logs --tail 50 seerrbot`.
 
@@ -294,8 +329,9 @@ python -m unittest discover -s tests -v
 ```
 
 The tests cover everything except the Discord layer: parsing Seerr's answers, seasons, status texts,
-requests, approvals, issues, the limit, the weekly post, the state file and errors, with a fake Seerr and
-no network. They need no extra packages.
+requests, approvals, issues, the limit, the weekly post, the state file and errors, the Sonarr, Radarr,
+qBittorrent and Jellyfin calls, the download brake, `/folgen`, `/verfolgen`, `/kalender`, `/zufall`,
+`/filmabend` and "Geschaut, löschen?", with fake servers and no network. They need no extra packages.
 
 ## License
 

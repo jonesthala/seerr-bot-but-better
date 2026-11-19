@@ -40,7 +40,7 @@ ANIME_KEYWORD = 210024  # TMDB keyword "anime", as Seerr uses it
 
 log = logging.getLogger("seerrbot.seerr")
 
-USER_AGENT = "seerr-discord-bot/1.0"
+USER_AGENT = "seerr-bot-but-better/1.0"
 MAX_BYTES = 5_000_000
 MAX_QUERY = 100
 
