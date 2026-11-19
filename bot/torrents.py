@@ -83,15 +83,38 @@ class QbitClient:
             raise TorrentError(f"qBittorrent meldet einen Fehler (HTTP {status}).")
         return body
 
-    def torrents(self, hashes: list[str]) -> list[dict]:
-        if not hashes:
-            return []
-        body = self._call("GET", "/torrents/info?" + urllib.parse.urlencode({"hashes": "|".join(hashes)}))
+    @staticmethod
+    def _torrent_list(body: bytes) -> list[dict]:
         try:
             data = json.loads(body)
         except ValueError:
             return []
         return [t for t in data if isinstance(t, dict)] if isinstance(data, list) else []
+
+    def torrents(self, hashes: list[str]) -> list[dict]:
+        if not hashes:
+            return []
+        return self._torrent_list(self._call("GET", "/torrents/info?" + urllib.parse.urlencode({"hashes": "|".join(hashes)})))
+
+    def all_torrents(self) -> list[dict]:
+        return self._torrent_list(self._call("GET", "/torrents/info"))
+
+    def _switch(self, hashes: list[str], old: str, new: str) -> None:
+        if not hashes:
+            return
+        form = {"hashes": "|".join(hashes)}
+        try:
+            self._call("POST", f"/torrents/{old}", form)
+        except TorrentError as error:
+            if "HTTP 404" not in str(error):
+                raise
+            self._call("POST", f"/torrents/{new}", form)  # qBittorrent 5 calls them stop and start
+
+    def pause(self, hashes: list[str]) -> None:
+        self._switch(hashes, "pause", "stop")
+
+    def resume(self, hashes: list[str]) -> None:
+        self._switch(hashes, "resume", "start")
 
     def delete(self, hashes: list[str]) -> None:
         """Removes the torrents and their files."""

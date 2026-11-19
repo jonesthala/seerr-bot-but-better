@@ -44,17 +44,29 @@ to Radarr or Sonarr as usual.
   time left), who asked for it, and free space. With Sonarr/Radarr (setup step 5) per title: episodes there,
   downloading, missing (which ones) and still to come, each download with a progress bar, time left and, with
   qBittorrent, speed and sources; stuck downloads with the reason; whether a search is running. A button
-  refreshes it. Who requests a show gets an automatic `/abo` for it, so new episodes arrive as DM.
+  refreshes it. Who requests a show gets an automatic `/abo` for it, so new episodes arrive as DM. Downloads
+  without a request in Seerr (from `/folgen` or added in Sonarr/Radarr) get a card too.
 - **`/neu`**: what came into the library last, with links. Optionally as a **weekly post** in the channel.
 - **`/problem <titel>`**: report a problem (picture, sound, subtitles, other) as an issue in Seerr.
 - **`/hilfe`**: the commands this person may use, each with an example. Admin commands only for admins.
 - **`/abo <serie>`** (needs the Jellyfin setup below): subscribe to a show in the library and get a DM when new
   episodes arrive in Jellyfin, grouped by season. Choosing the show again ends it; without a show it lists
   your subscriptions. Episodes already there when subscribing are not announced.
+- **`/zufall [Filme|Serien] [genre]`** (needs the Jellyfin setup): a movie or show from the library that wasn't
+  watched yet (by you if you have a Jellyfin account through the bot, else by anyone), with a *Nochmal* button.
+- **`/filmabend <titel> <zeit>`** (needs the Jellyfin setup): creates a Discord event (`20:00`, `morgen 20:15`,
+  `fr 20:00`, `21.11. 20:00`) with the poster and a SyncPlay guide; Discord reminds everyone who clicked
+  *Interessiert*. The bot needs the *Create Events* permission.
 
 **Housekeeping**
 - **Watches the disk.** Below `MIN_FREE_GB` free, new requests are refused with a clear message, and the
   bot posts once in the channel when space gets low and once when it is fine again.
+- **Download brake** (with qBittorrent, setup step 5): below `BRAKE_FREE_GB` free, the bot pauses the running
+  downloads in qBittorrent and says so in the channel; once there is 2 GB more again, it starts exactly those
+  again. Requests are refused earlier, but downloads that already run would otherwise fill the disk.
+- **`/folgen <serie> <folgen>`** (admins only, needs Sonarr): single episodes instead of whole seasons, e.g.
+  `S23E18-E25`, `S23` or, for anime, `1155-1170`. Shows what is there, what is missing and how much space it
+  needs; *Holen* monitors exactly these episodes in Sonarr and searches them.
 - **`/löschen <titel>`** (admins only): pick a movie or show from the library and delete it, files
   included, after a second confirmation click. It is reset in Seerr, so it can be requested again later.
   With qBittorrent access (setup step 5) it also removes the title's torrents with their files, so the space
@@ -73,8 +85,8 @@ to Radarr or Sonarr as usual.
 - **`/speicher`** (admins only): the ten titles that take the most space, how many files, when anyone last
   watched them and who requested them, plus free space. Helps to decide what `/löschen` should remove.
 
-Seasons and quality are chosen per request; single episodes can't be requested, because Seerr only
-requests whole seasons.
+Seasons and quality are chosen per request. Seerr only requests whole seasons; for single episodes, admins
+use `/folgen`, which talks to Sonarr directly.
 
 ## How it works
 
@@ -197,6 +209,7 @@ python -m bot    # remembers its state in ./data unless DATA_DIR says otherwise
 | `DISCORD_ADMIN_ROLE_ID`, `DISCORD_ADMIN_USER_IDS` | empty | Admins: may use `/löschen` and approve or decline requests in Discord; both empty = both off |
 | `DISCORD_APPROVAL_CHANNEL_ID` | the bot's channel | Where requests waiting for approval are posted with buttons |
 | `MIN_FREE_GB` | `15` | Refuse new requests and warn below this much free space |
+| `BRAKE_FREE_GB` | `3` | Pause running downloads in qBittorrent below this much free space; `0` = off |
 | `REQUEST_LIMIT`, `REQUEST_LIMIT_DAYS` | `0`, `7` | At most this many requests per person in this many days; `0` = no limit. Admins have none |
 | `MOVIE_PROFILES`, `TV_PROFILES` | empty | Radarr/Sonarr quality profiles to choose from, by name, e.g. `HD-1080p,Ultra-HD`; the first is preselected |
 | `WEEKLY_DIGEST` | empty | Post what's new every week, e.g. `sun 18:00` or `so 18:00`; empty = off |
@@ -208,7 +221,7 @@ python -m bot    # remembers its state in ./data unless DATA_DIR says otherwise
 | `JELLYFIN_FRIEND_LIBRARIES` | empty = all | Libraries friends may see, by name, e.g. `Movies,Shows` |
 | `JELLYFIN_FRIEND_BITRATE_MBIT` | `4` | Bitrate limit for friends streaming from outside; `0` = none |
 | `QBITTORRENT_URL`, `QBITTORRENT_USERNAME`, `QBITTORRENT_PASSWORD` | empty | `/löschen` also removes the torrents (with `SONARR_*` or `RADARR_*`) |
-| `SONARR_URL`, `SONARR_API_KEY`, `RADARR_URL`, `RADARR_API_KEY` | empty | Only read: which torrents belong to a show or movie |
+| `SONARR_URL`, `SONARR_API_KEY`, `RADARR_URL`, `RADARR_API_KEY` | empty | Which torrents belong to a show or movie, details in `/status`; Sonarr also for `/folgen` (the only writes: monitor and search episodes) |
 | `DATA_DIR` | `data` (`/data` in Docker) | Where `state.json` is kept |
 | `SEERR_URL` | `http://localhost:5055` | How the bot reaches Seerr |
 | `SEERR_API_KEY` | – | Seerr API key |

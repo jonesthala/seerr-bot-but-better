@@ -654,11 +654,14 @@ HELP = {  # command → (who, example)
     "problem": (REQUESTERS, "/problem Sintel Ton «kein Ton ab Minute 20»"),
     "jellyfin-zugang": (REQUESTERS, "/jellyfin-zugang"),
     "abo": (REQUESTERS, "/abo South Park"),
+    "zufall": (EVERYONE, "/zufall Filme Comedy"),
+    "filmabend": (REQUESTERS, "/filmabend Dune morgen 20:00"),
     "hilfe": (EVERYONE, "/hilfe"),
     "löschen": (ADMINS, "/löschen Sintel"),
     "jellyfin-liste": (ADMINS, "/jellyfin-liste"),
     "jellyfin-entziehen": (ADMINS, "/jellyfin-entziehen @person"),
     "speicher": (ADMINS, "/speicher"),
+    "folgen": (ADMINS, "/folgen One Piece S23E18-E25"),
 }
 
 

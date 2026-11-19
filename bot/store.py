@@ -89,6 +89,9 @@ class Store:
         # automatic abos for show requests whose show is not in Jellyfin yet: TMDB id → (Discord users, since when)
         self.pending_abos: dict[int, tuple[list[int], float]] = {}
         self.digest = ""
+        # download brake: on or off, and the torrents it paused (only these are started again)
+        self.brake_active = False
+        self.brake_hashes: list[str] = []
         self._load()
 
     # --- file ------------------------------------------------------------------
@@ -119,6 +122,9 @@ class Store:
         self.pending_abos = {int(k): ([int(u) for u in v.get("users", []) if str(u).isdigit()], float(v.get("since") or 0))
                              for k, v in pending.items() if str(k).isdigit() and isinstance(v, dict)}
         self.digest = str(data.get("digest") or "")
+        brake = data.get("brake") if isinstance(data.get("brake"), dict) else {}
+        self.brake_active = bool(brake.get("active"))
+        self.brake_hashes = [str(h) for h in brake.get("hashes") or [] if isinstance(h, str)]
 
     def save(self) -> None:
         if self.path is None:
@@ -131,6 +137,7 @@ class Store:
             "abos": {"users": {str(k): v for k, v in self.abos.items()}, "names": self.abo_names, "known": self.abo_known,
                      "pending": {str(k): {"users": users, "since": since} for k, (users, since) in self.pending_abos.items()}},
             "digest": self.digest,
+            "brake": {"active": self.brake_active, "hashes": self.brake_hashes},
         }
         tmp = None
         try:
@@ -277,6 +284,21 @@ class Store:
         return new
 
     # --- weekly digest -----------------------------------------------------------
+    # --- download brake -------------------------------------------------------------
+    def brake_pull(self, hashes: list[str]) -> bool:
+        """Remembers paused torrents; True if the brake was off until now."""
+        newly = not self.brake_active
+        self.brake_active = True
+        self.brake_hashes += [h for h in hashes if h not in self.brake_hashes]
+        self.save()
+        return newly
+
+    def brake_release(self) -> list[str]:
+        """Turns the brake off; the torrents to start again."""
+        hashes, self.brake_active, self.brake_hashes = self.brake_hashes, False, []
+        self.save()
+        return hashes
+
     def set_digest(self, key: str) -> None:
         self.digest = key
         self.save()

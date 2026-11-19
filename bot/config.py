@@ -102,6 +102,7 @@ class Settings:
     seerr_user_id: int | None
     seerr_public_url: str
     min_free_gb: int = 15
+    brake_free_gb: int = 3  # below this, running downloads are paused (0 = never)
     approval_channel_id: int | None = None
     data_dir: str = "data"
     request_limit: int = 0
@@ -189,6 +190,9 @@ class Settings:
         share_url = _text("TAILSCALE_SHARE_URL")
         if share_url and not share_url.startswith("https://"):
             raise ConfigError("TAILSCALE_SHARE_URL must be the invite link, starting with https://")
+        brake = _int("BRAKE_FREE_GB", 3)
+        if brake < 0:
+            raise ConfigError("BRAKE_FREE_GB must be 0 (off) or more")
         bitrate = _int("JELLYFIN_FRIEND_BITRATE_MBIT", 4)
         if bitrate < 0:
             raise ConfigError("JELLYFIN_FRIEND_BITRATE_MBIT must be 0 (no limit) or more")
@@ -205,6 +209,7 @@ class Settings:
             seerr_user_id=_int("SEERR_USER_ID", 0) or None,
             seerr_public_url=public,
             min_free_gb=_int("MIN_FREE_GB", 15),
+            brake_free_gb=brake,
             approval_channel_id=_int("DISCORD_APPROVAL_CHANNEL_ID", 0) or None,
             data_dir=_text("DATA_DIR") or "data",
             request_limit=limit,

@@ -1,11 +1,13 @@
-"""Sonarr and Radarr, read only. Standard library only; the HTTP call is injectable for the tests.
+"""Sonarr and Radarr. Standard library only; the HTTP call is injectable for the tests.
 
 - which downloads belonged to a title (torrent hashes, for /löschen)
 - what is going on right now (for /status): episodes there, missing and still to come, the downloads with
   their state, and whether a search is running
+- /folgen: the shows and their episodes, and the only writes: monitor single episodes and search them
 """
 from __future__ import annotations
 
+import json
 import logging
 import urllib.parse
 from dataclasses import dataclass
@@ -124,10 +126,17 @@ class ArrClient:
         self._fetch = fetch
 
     def _get(self, path: str, query: dict[str, Any] | None = None) -> Any:
+        return self._request("GET", path, query)
+
+    def _request(self, method: str, path: str, query: dict[str, Any] | None = None, body: Any = None) -> Any:
         url = f"{self.base_url}/api/v3{path}" + ("?" + urllib.parse.urlencode(query) if query else "")
         headers = {"X-Api-Key": self.api_key, "Accept": "application/json", "User-Agent": USER_AGENT}
+        data = None
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(body).encode("utf-8")
         try:
-            status, data = self._fetch("GET", url, headers, None)
+            status, data = self._fetch(method, url, headers, data)
         except Exception as exc:  # noqa: BLE001 - timeouts, refused
             log.warning("%s %s failed: %s", self.name, path, exc)
             raise ArrError(f"{self.name} ist nicht erreichbar.") from exc
@@ -143,6 +152,34 @@ class ArrClient:
             return [m["id"] for m in found or [] if isinstance(m, dict) and m.get("tmdbId") == tmdb_id]
         found = self._get("/series")
         return [s["id"] for s in found or [] if isinstance(s, dict) and s.get("tmdbId") == tmdb_id]
+
+    def series(self) -> list[dict]:
+        """Every show in Sonarr, with statistics (files, size) and images."""
+        return [s for s in self._get("/series") or [] if isinstance(s, dict) and isinstance(s.get("id"), int)]
+
+    def episodes(self, series_id: int) -> list[dict]:
+        return [e for e in self._get("/episode", {"seriesId": series_id}) or [] if isinstance(e, dict)]
+
+    def want_episodes(self, series: dict, episode_ids: list[int], search_ids: list[int]) -> None:
+        """/folgen: monitors these episodes (and the show, or Sonarr ignores them) and searches those that are out."""
+        if not series.get("monitored"):
+            self._request("PUT", f"/series/{series['id']}", body={**series, "monitored": True})
+        if episode_ids:
+            self._request("PUT", "/episode/monitor", body={"episodeIds": episode_ids, "monitored": True})
+        if search_ids:
+            self._request("POST", "/command", body={"name": "EpisodeSearch", "episodeIds": search_ids})
+
+    def queued_titles(self) -> dict[int, str]:
+        """TMDB id → 'Name (Jahr)' of everything in the download queue (for /status, also without a request)."""
+        key = "series" if self.kind == "tv" else "movie"
+        data = self._get("/queue", {"pageSize": 200, "includeSeries" if self.kind == "tv" else "includeMovie": "true"})
+        found: dict[int, str] = {}
+        for record in (data or {}).get("records") or [] if isinstance(data, dict) else []:
+            item = record.get(key) if isinstance(record, dict) else None
+            if isinstance(item, dict) and isinstance(item.get("tmdbId"), int) and item["tmdbId"] > 0:
+                year = item.get("year")
+                found[item["tmdbId"]] = f"{item.get('title', '?')} ({year})" if year else str(item.get("title", "?"))
+        return found
 
     def manages(self, tmdb_id: int) -> bool:
         """Whether Sonarr/Radarr know the title. Files that were in the library before them aren't theirs to delete."""

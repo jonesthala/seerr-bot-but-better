@@ -223,6 +223,29 @@ class JellyfinClient:
                 keys[key] = str(item.get("Name") or "")
         return keys
 
+    def library_items(self) -> list[dict]:
+        """Movies and shows with what /zufall and /filmabend show (genres, overview, running time, seasons)."""
+        data = self._call("GET", "/Items", {"Recursive": "true", "IncludeItemTypes": "Movie,Series", "SortBy": "SortName",
+                                           "Fields": "ProviderIds,Genres,Overview,ChildCount"})
+        found = data.get("Items") if isinstance(data, dict) else None
+        return [i for i in found or [] if isinstance(i, dict) and i.get("Id")]
+
+    def genres(self) -> list[str]:
+        data = self._call("GET", "/Genres", {"Recursive": "true", "IncludeItemTypes": "Movie,Series", "SortBy": "SortName"})
+        found = data.get("Items") if isinstance(data, dict) else None
+        return [str(g["Name"]) for g in found or [] if isinstance(g, dict) and g.get("Name")]
+
+    def played_ids(self, user_id: str | None = None) -> set[str]:
+        """Movies and shows watched to the end: by this Jellyfin user, or by anyone if None."""
+        users = [user_id] if user_id else [str(u["Id"]) for u in self.users() if u.get("Id")]
+        played: set[str] = set()
+        for user in users:
+            data = self._call("GET", "/Items", {"Recursive": "true", "IncludeItemTypes": "Movie,Series", "IsPlayed": "true",
+                                               "userId": user})
+            found = data.get("Items") if isinstance(data, dict) else None
+            played |= {str(i["Id"]) for i in found or [] if isinstance(i, dict) and i.get("Id")}
+        return played
+
     def folder_name(self, kind: str, tmdb_id: int) -> str | None:
         """The folder of a movie or show in the library, e.g. 'Call Me by Your Name (2017)' (for /löschen)."""
         data = self._call("GET", "/Items", {"Recursive": "true", "Fields": "ProviderIds,Path",

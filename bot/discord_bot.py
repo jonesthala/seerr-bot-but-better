@@ -4,8 +4,10 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import random
 import re
 import time
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -61,6 +63,26 @@ from .jellyfin import (
 )
 from .seerr import SeerrClient
 from .arr import ArrClient, ArrError, Progress, card, speed_text
+from .extras import (
+    BRAKE_MARGIN,
+    DOWNLOADING,
+    MAX_EPISODES,
+    EpisodePlan,
+    brake_decision,
+    brake_pulled_text,
+    brake_released_text,
+    event_description,
+    event_end,
+    item_label,
+    parse_episodes,
+    parse_when,
+    per_episode_estimate,
+    pick_candidates,
+    pick_facts,
+    plan_episodes,
+    plan_lines,
+    select_episodes,
+)
 from .torrents import QbitClient, TorrentCleaner, TorrentError
 from .store import FRIEND_APPROVED, FRIEND_DECLINED, FRIEND_PENDING, FRIEND_REVOKED, Approval, Friend, Store
 
@@ -75,6 +97,8 @@ SERIES_CACHE_SECONDS = 600  # the list of shows for /abo suggestions
 RATE_CACHE_SECONDS = 3600  # GB per hour measured in the library, for the size estimate
 AUTOCOMPLETE_SECONDS = 2.5  # Discord gives up after 3 s
 MAX_CHECKS_PER_RUN = 30
+BRAKE_MINUTES = 1  # the download brake looks this often at the free space
+LIBRARY_CACHE_SECONDS = 600  # movies, shows and genres for /zufall and /filmabend
 NO_ROLE = "🔒 Anfragen dürfen nur Leute mit der Rolle für Film- und Serienwünsche."
 NO_ADMIN = "🔒 Löschen dürfen nur Admins."
 NO_DELETING = "🔒 Löschen ist nicht eingerichtet: Es fehlen `DISCORD_ADMIN_USER_IDS` oder `DISCORD_ADMIN_ROLE_ID`."
@@ -190,6 +214,8 @@ class SeerrBot(discord.Client):
         self.status_clicks: dict[int, float] = {}  # status message → last refresh
         self._posters: dict[tuple[str, int], str | None] = {}  # for the /status cards
         self._rate: tuple[float, SizeRate] = (0.0, RULE_OF_THUMB)  # (when measured, GB per hour)
+        self._library: tuple[float, list[dict], list[str]] = (0.0, [], [])  # (when loaded, items, genres)
+        self._sonarr: tuple[float, list[dict]] = (0.0, [])  # (when loaded, shows) for /folgen suggestions
         self._background: set[asyncio.Task] = set()
 
     async def setup_hook(self) -> None:
@@ -201,6 +227,8 @@ class SeerrBot(discord.Client):
         await self.load_profiles()
         self.space_loop.start()
         self.watch_loop.start()
+        if self.qbit is not None and self.settings.brake_free_gb > 0:
+            self.brake_loop.start()
         if self.settings.weekly_digest:
             self.digest_loop.start()
         if self.jellyfin is not None:
@@ -315,10 +343,18 @@ class SeerrBot(discord.Client):
         except Exception:  # noqa: BLE001 - the loop must keep running
             log.exception("Abo check failed")
 
+    @tasks.loop(minutes=BRAKE_MINUTES)
+    async def brake_loop(self) -> None:
+        try:
+            await self.check_brake()
+        except Exception:  # noqa: BLE001 - the loop must keep running
+            log.exception("Download brake check failed")
+
     @space_loop.before_loop
     @watch_loop.before_loop
     @digest_loop.before_loop
     @abo_loop.before_loop
+    @brake_loop.before_loop
     async def _wait_until_ready(self) -> None:
         await self.wait_until_ready()
 
@@ -401,21 +437,73 @@ class SeerrBot(discord.Client):
                 return None
         return self._posters[key]
 
+    async def library(self) -> tuple[list[dict], list[str]]:
+        """Movies, shows and genres from Jellyfin for /zufall and /filmabend, reloaded every few minutes."""
+        loaded, items, genres = self._library
+        if self.jellyfin is not None and (not items or time.monotonic() - loaded > LIBRARY_CACHE_SECONDS):
+            items = await asyncio.to_thread(self.jellyfin.library_items)
+            genres = await asyncio.to_thread(self.jellyfin.genres)
+            self._library = (time.monotonic(), items, genres)
+        return items, genres
+
+    async def sonarr_series(self) -> list[dict]:
+        """The shows in Sonarr for the /folgen suggestions, reloaded every few minutes."""
+        loaded, shows = self._sonarr
+        sonarr = self.arrs.get("tv")
+        if sonarr is not None and (not shows or time.monotonic() - loaded > SERIES_CACHE_SECONDS):
+            shows = await asyncio.to_thread(sonarr.series)
+            self._sonarr = (time.monotonic(), shows)
+        return shows
+
+    def jellyfin_link(self, item_id: str) -> str | None:
+        base = self.settings.jellyfin_url or self.settings.jellyfin_friend_url or self.settings.jellyfin_api_url
+        return f"{base.rstrip('/')}/web/index.html#!/details?id={item_id}" if base else None
+
+    async def check_brake(self) -> None:
+        """Pauses the running downloads when the disk is nearly full, starts them again once there is room."""
+        if self.qbit is None or self.settings.brake_free_gb <= 0:
+            return
+        limit = self.settings.brake_free_gb * GB
+        free = await asyncio.to_thread(self.seerr.free_bytes)
+        decision = brake_decision(free, self.store.brake_active, limit)
+        if decision == "pull" and free is not None:
+            running = [t for t in await asyncio.to_thread(self.qbit.all_torrents)
+                       if t.get("state") in DOWNLOADING and t.get("hash")]
+            if not running:
+                return
+            await asyncio.to_thread(self.qbit.pause, [str(t["hash"]) for t in running])
+            log.warning("Download brake: %s free, paused %d downloads", size_text(free), len(running))
+            if self.store.brake_pull([str(t["hash"]).lower() for t in running]):
+                await self.post(brake_pulled_text(free, [escape(str(t.get("name") or "?")) for t in running], limit))
+        elif decision == "release" and free is not None:
+            hashes = self.store.brake_hashes
+            still = [str(t["hash"]) for t in await asyncio.to_thread(self.qbit.torrents, hashes) if t.get("hash")]
+            await asyncio.to_thread(self.qbit.resume, still)
+            self.store.brake_release()
+            log.info("Download brake released: %s free, resumed %d downloads", size_text(free), len(still))
+            await self.post(brake_released_text(free, len(still)))
+
     async def status_embeds(self) -> list[discord.Embed]:
-        """/status: a summary card, then one card per open request with bars, episodes and downloads."""
+        """/status: a summary card, then one card per open request with bars, episodes and downloads, then
+        downloads without a request in Seerr (from /folgen or added in Sonarr/Radarr directly)."""
         items = await asyncio.to_thread(self.seerr.open_requests)
         free = await asyncio.to_thread(self.seerr.free_bytes)
         now = datetime.now(timezone.utc)
+        requested = {(i.kind, i.tmdb_id) for i, _ in items}
+        extra: list[tuple[str, int, str]] = []
         details: dict[tuple[str, int], Progress] = {}
         problems: list[str] = []
         for kind, arr in self.arrs.items():
-            ids = [i.tmdb_id for i, _ in items if i.kind == kind and i.request_status != REQUEST_PENDING]
-            if ids:
-                try:
+            try:
+                queued = await asyncio.to_thread(arr.queued_titles)
+                extra += [(kind, tmdb_id, name) for tmdb_id, name in queued.items() if (kind, tmdb_id) not in requested]
+                ids = [i.tmdb_id for i, _ in items if i.kind == kind and i.request_status != REQUEST_PENDING]
+                ids += [tmdb_id for k, tmdb_id, _ in extra if k == kind]
+                if ids:
                     found = await asyncio.to_thread(arr.progress, ids, now)
                     details.update({(kind, tmdb_id): progress for tmdb_id, progress in found.items()})
-                except ArrError as error:
-                    problems.append(f"⚠️ {error}")
+            except ArrError as error:
+                problems.append(f"⚠️ {error}")
         live: dict[str, dict] = {}
         hashes = [d.hash for p in details.values() for d in p.downloads if d.hash and d.state == "downloading"]
         if self.qbit is not None and hashes:
@@ -425,15 +513,33 @@ class SeerrBot(discord.Client):
                 pass  # without speed
         colors = {"blue": discord.Color.blue(), "orange": discord.Color.orange(), "green": discord.Color.green(),
                   "gold": discord.Color.gold()}
-        cards, speed, active = [], 0, 0
+        cards: list[discord.Embed] = []
+        speed, active = 0, 0
+
+        async def new_card(kind: str, tmdb_id: int, name: str) -> discord.Embed:
+            embed = discord.Embed(title=shorten(name, 256), url=self.settings.page_url(kind, tmdb_id))
+            embed.set_author(name="📺 Serie" if kind == "tv" else "🎬 Film")
+            poster = await self.poster(kind, tmdb_id)
+            if poster:
+                embed.set_thumbnail(url=poster)
+            return embed
+
+        def fill(embed: discord.Embed, kind: str, progress: Progress) -> None:
+            nonlocal speed, active
+            info = card(kind, progress, live, now)
+            speed += info.speed
+            active += sum(1 for d in progress.downloads if d.state == "downloading")
+            embed.description = info.headline
+            embed.color = colors[info.color]
+            for field, value in (("Folgen", info.counts), ("Lädt gerade", "\n".join(info.active)),
+                                 ("Pausiert / Probleme", "\n".join(info.other)), ("Fehlt noch", info.missing)):
+                if value:
+                    embed.add_field(name=field, value=value[:1024], inline=False)
+
         for item, name in items[:STATUS_CARDS]:
             tracked = self.store.request(item.request_id)
             who = tracked.user_name if tracked else item.requested_by
-            embed = discord.Embed(title=shorten(name, 256), url=self.settings.page_url(item.kind, item.tmdb_id))
-            embed.set_author(name="📺 Serie" if item.kind == "tv" else "🎬 Film")
-            poster = await self.poster(item.kind, item.tmdb_id)
-            if poster:
-                embed.set_thumbnail(url=poster)
+            embed = await new_card(item.kind, item.tmdb_id, name)
             progress = details.get((item.kind, item.tmdb_id))
             if item.request_status == REQUEST_PENDING:
                 embed.description = "⏳ **Wartet auf Freigabe** durch einen Admin."
@@ -442,30 +548,35 @@ class SeerrBot(discord.Client):
                 embed.description = item.state(now)
                 embed.color = discord.Color.blurple()
             else:
-                info = card(item.kind, progress, live, now)
-                speed += info.speed
-                active += sum(1 for d in progress.downloads if d.state == "downloading")
-                embed.description = info.headline
-                embed.color = colors[info.color]
-                for field, value in (("Folgen", info.counts), ("Lädt gerade", "\n".join(info.active)),
-                                     ("Pausiert / Probleme", "\n".join(info.other)), ("Fehlt noch", info.missing)):
-                    if value:
-                        embed.add_field(name=field, value=value[:1024], inline=False)
+                fill(embed, item.kind, progress)
             if who:
                 embed.set_footer(text=f"Angefragt von {who}")
             cards.append(embed)
+        for kind, tmdb_id, name in extra:
+            progress = details.get((kind, tmdb_id))
+            if progress is None or len(cards) >= STATUS_CARDS:
+                continue
+            embed = await new_card(kind, tmdb_id, name)
+            fill(embed, kind, progress)
+            embed.set_footer(text="Ohne Anfrage in Seerr geladen, z.B. mit /folgen")
+            cards.append(embed)
+        parts = []
         if items:
-            head = [f"**{len(items)}** offene {'Anfrage' if len(items) == 1 else 'Anfragen'}"]
-            if active:
-                head[0] += f" · ⬇️ **{active}** {'Download' if active == 1 else 'Downloads'} aktiv"
-            if speed:
-                head[0] += f" · {speed_text(speed)}"
-        else:
-            head = ["📭 Keine offenen Anfragen. Alles Angefragte ist schon da."]
+            parts.append(f"**{len(items)}** offene {'Anfrage' if len(items) == 1 else 'Anfragen'}")
+        if extra:
+            parts.append(f"**{len(extra)}** ohne Anfrage")
+        if active:
+            parts.append(f"⬇️ **{active}** {'Download' if active == 1 else 'Downloads'} aktiv")
+        if speed:
+            parts.append(speed_text(speed))
+        head = [" · ".join(parts)] if parts else ["📭 Keine offenen Anfragen. Alles Angefragte ist schon da."]
         if free is not None:
             minimum = self.settings.min_free_gb * GB
             head.append(f"💾 **Nur noch {size_text(free)} frei**, neue Anfragen sind gesperrt." if free < minimum
                         else f"💾 Noch **{size_text(free)}** frei")
+        if self.store.brake_active:
+            resume_at = size_text(self.settings.brake_free_gb * GB + BRAKE_MARGIN)
+            head.append(f"🛑 **Notbremse aktiv:** Downloads sind angehalten, bis wieder {resume_at} frei sind.")
         if len(items) > STATUS_CARDS:
             head.append(f"… und {len(items) - STATUS_CARDS} weitere Anfragen")
         summary = discord.Embed(title="📊 Status", description="\n".join(head + problems), color=discord.Color.blurple())
@@ -1103,6 +1214,157 @@ class DeletePicker(Picker):
 
 
 # --- slash commands -----------------------------------------------------------
+WEEKDAY_NAMES = ("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag")
+
+
+def fetch_image(url: str) -> bytes | None:
+    """A poster for the Discord event; None if it can't be loaded (the event works without)."""
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "seerr-discord-bot"})
+        with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310 (poster URL from Seerr/TMDB)
+            data = response.read(8_000_001)
+    except Exception:  # noqa: BLE001 - just no picture
+        return None
+    return data if 0 < len(data) <= 8_000_000 else None
+
+
+class EpisodeConfirm(discord.ui.View):
+    """/folgen: what would be fetched, and the button that tells Sonarr."""
+
+    def __init__(self, bot: SeerrBot, owner: discord.abc.User, show: dict, plan: EpisodePlan, free: int | None) -> None:
+        super().__init__(timeout=PICK_TIMEOUT)
+        self.bot, self.owner, self.show, self.plan, self.free = bot, owner, show, plan, free
+        self.message: discord.Message | None = None
+
+    @property
+    def label(self) -> str:
+        year = self.show.get("year")
+        return f"{self.show.get('title', '?')} ({year})" if year else str(self.show.get("title", "?"))
+
+    def embed(self, head: str | None = None, color: discord.Color | None = None) -> discord.Embed:
+        lines = plan_lines(self.plan, self.free, self.bot.settings.min_free_gb * GB)
+        if not self.plan.get and not self.plan.later:
+            lines.insert(0, "✅ Diese Folgen sind alle schon da.")
+        embed = discord.Embed(title=f"📺 {self.label}", description="\n".join(([head] if head else []) + lines)[:4000],
+                              color=color or discord.Color.blurple())
+        poster = next((i.get("remoteUrl") for i in self.show.get("images") or []
+                       if isinstance(i, dict) and i.get("coverType") == "poster" and i.get("remoteUrl")), None)
+        if poster:
+            embed.set_thumbnail(url=poster)
+        embed.set_footer(text="Nur diese Folgen, nicht die ganze Staffel.")
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner.id:
+            return True
+        await interaction.response.send_message(NOT_YOURS, ephemeral=True)
+        return False
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        await report_error(interaction, error)
+
+    async def on_timeout(self) -> None:
+        if self.message is not None:
+            try:
+                await self.message.edit(view=None)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="Holen", emoji="⬇️", style=discord.ButtonStyle.success)
+    async def fetch_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer()
+        wanted = [e["id"] for e in self.plan.get + self.plan.later]
+        await asyncio.to_thread(self.bot.arrs["tv"].want_episodes, self.show, wanted, [e["id"] for e in self.plan.get])
+        self.stop()
+        count = len(self.plan.get)
+        head = (f"✅ **Sonarr sucht jetzt {count} {'Folge' if count == 1 else 'Folgen'}.** Fortschritt in `/status`."
+                if count else "✅ **Vorgemerkt:** Sonarr holt die Folgen, sobald sie erscheinen.")
+        tmdb_id = self.show.get("tmdbId")
+        if isinstance(tmdb_id, int) and tmdb_id > 0:
+            title = Title("tv", tmdb_id, str(self.show.get("title") or ""), str(self.show.get("year") or ""), "", None, 0)
+            note = await self.bot.auto_abo(interaction.user.id, title)
+            if note:
+                head += f"\n{note}"
+        embed = self.embed(head, discord.Color.green())
+        embed.set_footer(text=f"Geholt von {interaction.user.display_name}")
+        await interaction.edit_original_response(embed=embed, view=None)
+
+    @discord.ui.button(label="Abbrechen", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await interaction.response.edit_message(embed=self.embed("❌ Abgebrochen, nichts geholt.", discord.Color.light_grey()),
+                                                view=None)
+
+
+class RandomPick(discord.ui.View):
+    """/zufall: a suggestion from the library that wasn't watched, and a button for the next one."""
+
+    def __init__(self, bot: SeerrBot, owner: discord.abc.User, kind: str | None, genre: str | None) -> None:
+        super().__init__(timeout=PICK_TIMEOUT)
+        self.bot, self.owner, self.kind, self.genre = bot, owner, kind, genre
+        self.message: discord.Message | None = None
+        self.played: set[str] | None = None
+        self.seen: set[str] = set()
+        self.link: discord.ui.Button | None = None
+        friend = bot.store.friend(owner.id)
+        # friends with a Jellyfin account get what *they* haven't watched; everyone else what nobody has
+        self.jellyfin_user = friend.jellyfin_id if friend is not None and friend.state == FRIEND_APPROVED else None
+
+    async def roll(self) -> discord.Embed | None:
+        items, _ = await self.bot.library()
+        if self.played is None:
+            self.played = await asyncio.to_thread(self.bot.jellyfin.played_ids, self.jellyfin_user or None)
+        candidates = pick_candidates(items, self.played, self.kind, self.genre)
+        if not candidates:
+            return None
+        fresh = [i for i in candidates if str(i["Id"]) not in self.seen] or candidates
+        item = random.choice(fresh)
+        self.seen.add(str(item["Id"]))
+        overview = shorten(str(item.get("Overview") or "Keine Beschreibung vorhanden."), 400)
+        embed = discord.Embed(title=f"🎲 {item_label(item)}", description=f"{pick_facts(item)}\n\n{escape(overview)}",
+                              color=discord.Color.purple())
+        tmdb = str((item.get("ProviderIds") or {}).get("Tmdb") or "")
+        if tmdb.isdigit():
+            poster = await self.bot.poster("movie" if item.get("Type") == "Movie" else "tv", int(tmdb))
+            if poster:
+                embed.set_thumbnail(url=poster)
+        whose = "Hast du noch nicht geschaut" if self.jellyfin_user else "Hat noch niemand fertig geschaut"
+        embed.set_footer(text=f"{whose} · {len(candidates)} zur Auswahl")
+        self._set_link(self.bot.jellyfin_link(str(item["Id"])))
+        return embed
+
+    def _set_link(self, url: str | None) -> None:
+        if self.link is not None:
+            self.remove_item(self.link)
+            self.link = None
+        if url:
+            self.link = discord.ui.Button(style=discord.ButtonStyle.link, label="Jetzt ansehen", emoji="▶️", url=url)
+            self.add_item(self.link)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner.id:
+            return True
+        await interaction.response.send_message(NOT_YOURS, ephemeral=True)
+        return False
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        await report_error(interaction, error)
+
+    async def on_timeout(self) -> None:
+        if self.message is not None:
+            try:
+                await self.message.edit(view=None)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="Nochmal", emoji="🎲", style=discord.ButtonStyle.primary)
+    async def again(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer()
+        embed = await self.roll()
+        if embed is not None:
+            await interaction.edit_original_response(embed=embed, view=self)
+
+
 def build_commands(bot: SeerrBot) -> list[app_commands.Command]:
     def requester(interaction: discord.Interaction) -> bool:
         if bot.may_request(interaction):
@@ -1273,6 +1535,7 @@ def build_commands(bot: SeerrBot) -> list[app_commands.Command]:
     commands = [film, serie, trending, neu, status, problem, loeschen]
     if bot.jellyfin is not None:
         commands += friend_commands(bot, requester)
+    commands += extra_commands(bot, requester)
     return commands + [hilfe]
 
 
@@ -1398,3 +1661,153 @@ def friend_commands(bot: SeerrBot, requester) -> list[app_commands.Command]:
         await interaction.followup.send(text, ephemeral=True)
 
     return [jellyfin_zugang, jellyfin_entziehen, jellyfin_liste, speicher, abo]
+
+
+def extra_commands(bot: SeerrBot, requester) -> list[app_commands.Command]:
+    """/folgen (admins, needs Sonarr), /zufall and /filmabend (need Jellyfin)."""
+    def only_admin(interaction: discord.Interaction) -> bool:
+        if bot.is_admin(interaction):
+            return True
+        raise NotAllowed(NO_FRIEND_ADMIN)
+
+    async def suggest_sonarr(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        try:
+            shows = await asyncio.wait_for(bot.sonarr_series(), AUTOCOMPLETE_SECONDS)
+        except Exception:  # noqa: BLE001 - no suggestions is fine, typing still works
+            return []
+        text = current.strip().casefold()
+        found = sorted((s for s in shows if text in str(s.get("title", "")).casefold()),
+                       key=lambda s: str(s.get("sortTitle") or s.get("title") or ""))
+        return [app_commands.Choice(name=shorten(f"{s.get('title', '?')} ({s.get('year')})", 100), value=str(s["id"]))
+                for s in found][:25]
+
+    @app_commands.command(name="folgen", description="Einzelne Folgen einer Serie holen statt ganzer Staffeln (nur Admins)")
+    @app_commands.describe(serie="Serie aus Sonarr", folgen="z.B. S23E18-E25, S23 oder bei Anime 1155-1170")
+    @app_commands.autocomplete(serie=suggest_sonarr)
+    @app_commands.check(only_admin)
+    async def folgen(interaction: discord.Interaction, serie: str, folgen: str) -> None:
+        await interaction.response.defer(thinking=True)
+        sonarr = bot.arrs["tv"]
+        shows = await asyncio.to_thread(sonarr.series)  # fresh, the show is written back if it isn't monitored
+        wanted = serie.strip()
+        show = next((s for s in shows if str(s["id"]) == wanted), None) or next(
+            (s for s in shows if str(s.get("title", "")).casefold().startswith(wanted.casefold())), None)
+        if show is None:
+            await interaction.followup.send(f"🔎 Diese Serie ist nicht in Sonarr: **{escape(wanted)}**. "
+                                            "Zuerst mit `/serie` anfragen.")
+            return
+        try:
+            chosen = select_episodes(await asyncio.to_thread(sonarr.episodes, show["id"]), parse_episodes(folgen))
+        except ValueError as error:
+            await interaction.followup.send(f"⚠️ {error}")
+            return
+        name = escape(str(show.get("title") or "?"))
+        if not chosen:
+            await interaction.followup.send(f"🔎 Diese Folgen gibt es bei **{name}** nicht: {escape(folgen.strip())}")
+            return
+        if len(chosen) > MAX_EPISODES:
+            await interaction.followup.send(f"⚠️ Das wären {len(chosen)} Folgen, mehr als {MAX_EPISODES} auf einmal geht "
+                                            "nicht. Ganze Staffeln lieber mit `/serie` anfragen.")
+            return
+        rate = await bot.size_rate()
+        plan = plan_episodes(chosen, datetime.now(timezone.utc), per_episode_estimate(show, rate.typical))
+        try:
+            free = await asyncio.to_thread(bot.seerr.free_bytes, "tv")
+        except Exception:  # noqa: BLE001 - only for the estimate
+            free = None
+        view = EpisodeConfirm(bot, interaction.user, show, plan, free)
+        if not plan.get and not plan.later:
+            await interaction.followup.send(embed=view.embed())
+            return
+        view.message = await interaction.followup.send(embed=view.embed(), view=view, wait=True)
+
+    async def suggest_genre(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        try:
+            _, genres = await asyncio.wait_for(bot.library(), AUTOCOMPLETE_SECONDS)
+        except Exception:  # noqa: BLE001
+            return []
+        text = current.strip().casefold()
+        return [app_commands.Choice(name=g[:100], value=g[:100]) for g in genres if text in g.casefold()][:25]
+
+    @app_commands.command(name="zufall", description="Schlägt einen Film oder eine Serie vor, die du noch nicht geschaut hast")
+    @app_commands.describe(art="Nur Filme oder nur Serien", genre="Nur dieses Genre, z.B. Comedy oder Animation")
+    @app_commands.choices(art=[app_commands.Choice(name="Filme", value="movie"),
+                               app_commands.Choice(name="Serien", value="tv")])
+    @app_commands.autocomplete(genre=suggest_genre)
+    async def zufall(interaction: discord.Interaction, art: Optional[app_commands.Choice[str]] = None,
+                     genre: Optional[str] = None) -> None:
+        await interaction.response.defer(thinking=True)
+        view = RandomPick(bot, interaction.user, art.value if art else None, genre)
+        embed = await view.roll()
+        if embed is None:
+            what = {"movie": "Filme", "tv": "Serien"}.get(art.value if art else "", "Filme oder Serien")
+            where = f" im Genre **{escape(genre)}**" if genre else ""
+            await interaction.followup.send(f"📭 Keine {what}{where} gefunden, die noch nicht geschaut wurden.")
+            return
+        view.message = await interaction.followup.send(embed=embed, view=view, wait=True)
+
+    async def suggest_title(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        try:
+            items, _ = await asyncio.wait_for(bot.library(), AUTOCOMPLETE_SECONDS)
+        except Exception:  # noqa: BLE001
+            return []
+        text = current.strip().casefold()
+        return [app_commands.Choice(name=shorten(f"{item_label(i)} · {'Film' if i.get('Type') == 'Movie' else 'Serie'}", 100),
+                                    value=str(i["Id"])) for i in items if text in item_label(i).casefold()][:25]
+
+    @app_commands.command(name="filmabend", description="Filmabend planen: Discord-Event mit Erinnerung und SyncPlay-Anleitung")
+    @app_commands.describe(titel="Film oder Serie aus der Bibliothek", zeit="z.B. 20:00, morgen 20:15, fr 20:00 oder 21.11. 20:00")
+    @app_commands.autocomplete(titel=suggest_title)
+    @app_commands.check(requester)
+    async def filmabend(interaction: discord.Interaction, titel: str, zeit: str) -> None:
+        await interaction.response.defer(thinking=True)
+        items, _ = await bot.library()
+        wanted = titel.strip()
+        item = next((i for i in items if str(i["Id"]) == wanted), None) or next(
+            (i for i in items if item_label(i).casefold().startswith(wanted.casefold())), None)
+        if item is None:
+            await interaction.followup.send(f"🔎 Das ist nicht in der Bibliothek: **{escape(wanted)}**. "
+                                            "Mit `/film` oder `/serie` kannst du es anfragen.")
+            return
+        try:
+            start = parse_when(zeit, datetime.now(bot.settings.zone))
+        except ValueError as error:
+            await interaction.followup.send(f"⚠️ {error}")
+            return
+        label = item_label(item)
+        link = bot.jellyfin_link(str(item["Id"]))
+        tmdb = str((item.get("ProviderIds") or {}).get("Tmdb") or "")
+        poster = await bot.poster("movie" if item.get("Type") == "Movie" else "tv", int(tmdb)) if tmdb.isdigit() else None
+        details = {"name": shorten(f"🍿 Filmabend: {label}", 100), "start_time": start,
+                   "end_time": event_end(start, item.get("RunTimeTicks")), "entity_type": discord.EntityType.external,
+                   "privacy_level": discord.PrivacyLevel.guild_only, "location": "Jellyfin · SyncPlay",
+                   "description": event_description(label, link)}
+        image = await asyncio.to_thread(fetch_image, poster) if poster else None
+        if image:
+            details["image"] = image
+        try:
+            event = await interaction.guild.create_scheduled_event(**details, reason=f"/filmabend von {interaction.user}")
+        except discord.Forbidden:
+            await interaction.followup.send("⚠️ Dem Bot fehlt die Berechtigung **Events erstellen**. Ein Admin kann sie in "
+                                            "den Servereinstellungen unter Rollen geben.")
+            return
+        when = f"{WEEKDAY_NAMES[start.weekday()]}, {start:%d.%m.} um {start:%H:%M}"
+        embed = discord.Embed(title=f"🍿 Filmabend: {label}", url=event.url, color=discord.Color.gold(),
+                              description=f"📅 **{when}**\n\nKlick im Event auf **Interessiert**, dann erinnert dich "
+                                          "Discord, wenn es losgeht. Geschaut wird zusammen mit SyncPlay in Jellyfin, "
+                                          "die Anleitung steht im Event.")
+        if poster:
+            embed.set_thumbnail(url=poster)
+        embed.set_footer(text=f"Geplant von {interaction.user.display_name}")
+        view = discord.ui.View(timeout=None)
+        view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Zum Event", emoji="📅", url=event.url))
+        if link:
+            view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="In Jellyfin", emoji="▶️", url=link))
+        await interaction.followup.send(embed=embed, view=view)
+
+    commands: list[app_commands.Command] = []
+    if "tv" in bot.arrs:
+        commands.append(folgen)
+    if bot.jellyfin is not None:
+        commands += [zufall, filmabend]
+    return commands
