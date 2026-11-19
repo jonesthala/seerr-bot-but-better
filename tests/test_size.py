@@ -70,5 +70,21 @@ class LibraryRateTest(unittest.TestCase):
         self.assertEqual(sorted(JellyfinClient("http://j", "k", fetch=fake).size_rates()), [2.0, 2.0])
 
 
+class SeerrStatusTest(unittest.TestCase):
+    """Seerr 3.5.1: 6 = blocklisted, 7 = deleted (found 19.11. when Fullmetal Alchemist was deleted)."""
+
+    def test_deleted_show_can_be_requested_again(self):
+        show = title_from({"id": 31911, "name": "Fullmetal Alchemist: Brotherhood", "seasons": [{"seasonNumber": 1, "episodeCount": 64}],
+                           "mediaInfo": {"id": 12, "status": 7, "seasons": [{"seasonNumber": 1, "status": 7}]}}, "tv")
+        self.assertEqual(show.requestable_seasons(), [1])
+        self.assertTrue(show.requestable)
+        self.assertIn("gelöscht", show.status_text())
+
+    def test_blocklisted_cannot(self):
+        movie = title_from({"id": 1, "title": "X", "mediaInfo": {"status": 6}}, "movie")
+        self.assertFalse(movie.requestable)
+        self.assertIn("Gesperrt", movie.status_text())
+
+
 if __name__ == "__main__":
     unittest.main()

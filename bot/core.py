@@ -16,7 +16,8 @@ GB = 1024 ** 3
 SPACE_MARGIN = 2 * GB  # "enough space again" only this far above the minimum, so it doesn't flap
 
 # Availability of a movie, show or season in Seerr (MediaInfo.status)
-UNKNOWN, PENDING, PROCESSING, PARTIAL, AVAILABLE, DELETED = 1, 2, 3, 4, 5, 6
+# Seerr's MediaStatus (3.5.1): 6 is "blocklisted", 7 "deleted" (removed from the library, may be requested again)
+UNKNOWN, PENDING, PROCESSING, PARTIAL, AVAILABLE, BLOCKLISTED, DELETED = 1, 2, 3, 4, 5, 6, 7
 # Status of a request (MediaRequest.status)
 REQUEST_PENDING, REQUEST_APPROVED, REQUEST_DECLINED, REQUEST_FAILED, REQUEST_COMPLETED = 1, 2, 3, 4, 5
 
@@ -102,7 +103,8 @@ class Title:
 
 STATUS_TEXT = {
     UNKNOWN: "➕ Noch nicht da, kann angefragt werden",
-    DELETED: "➕ Noch nicht da, kann angefragt werden",
+    DELETED: "🗑️ Wurde gelöscht, kann wieder angefragt werden",
+    BLOCKLISTED: "🚫 Gesperrt, kann nicht angefragt werden",
     PENDING: "⏳ Schon angefragt, wartet auf Freigabe",
     PROCESSING: "⬇️ Schon angefragt, wird gesucht oder geladen",
     PARTIAL: "🟡 Teilweise da",
