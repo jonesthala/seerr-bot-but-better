@@ -656,6 +656,8 @@ HELP = {  # command → (who, example)
     "abo": (REQUESTERS, "/abo South Park"),
     "zufall": (EVERYONE, "/zufall Filme Comedy"),
     "filmabend": (REQUESTERS, "/filmabend Dune morgen 20:00"),
+    "verfolgen": (REQUESTERS, "/verfolgen Dexter ab S02E04"),
+    "kalender": (EVERYONE, "/kalender"),
     "hilfe": (EVERYONE, "/hilfe"),
     "löschen": (ADMINS, "/löschen Sintel"),
     "jellyfin-liste": (ADMINS, "/jellyfin-liste"),

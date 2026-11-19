@@ -381,3 +381,102 @@ def episodes_deleted_text(count: int, freed: int, removed: tuple[int, int, int] 
     if busy:
         text += " Ein Torrent lädt noch oder wird gerade übernommen, sein Platz wird später frei."
     return text
+
+
+# --- /verfolgen and /kalender ---------------------------------------------------------------------------
+WEEKDAYS_SHORT = ("Mo", "Di", "Mi", "Do", "Fr", "Sa", "So")
+
+
+def when_text(when: datetime, zone) -> str:
+    local = when.astimezone(zone)
+    return f"{WEEKDAYS_SHORT[local.weekday()]} {local:%d.%m.} um {local:%H:%M}"
+
+
+def parse_start(text: str | None) -> Span | None:
+    """/verfolgen ab: one episode ("S02E04", or absolute "1181" for anime); empty or "jetzt": only what is to come."""
+    cleaned = (text or "").strip()
+    if not cleaned or cleaned.lower() in ("jetzt", "neu", "now"):
+        return None
+    spans = parse_episodes(cleaned)
+    if len(spans) != 1 or spans[0].start != spans[0].end and not (spans[0].start[0] is not None and spans[0].end[1] == WHOLE_SEASON):
+        raise ValueError("Bei `ab` bitte genau eine Folge angeben, z.B. `S02E04` oder bei Anime `1181`.")
+    return spans[0]
+
+
+def start_episode(span: Span | None, episodes: list[dict]) -> tuple[int, int] | None:
+    """The (season, episode) to start at; absolute numbers are looked up in Sonarr's episodes."""
+    if span is None:
+        return None
+    if not span.absolute:
+        return span.start  # type: ignore[return-value]
+    match = next((e for e in episodes if e.get("absoluteEpisodeNumber") == span.start[1]
+                  and isinstance(e.get("seasonNumber"), int) and e["seasonNumber"] > 0), None)
+    if match is None:
+        raise ValueError(f"Folge {span.start[1]} gibt es bei dieser Serie nicht (oder sie hat keine durchgehende Nummerierung). "
+                         "Bitte mit Staffel, z.B. `S02E04`.")
+    return match["seasonNumber"], match["episodeNumber"]
+
+
+def follow_lines(label: str, start: tuple[int, int] | None, get: list[dict], later: list[dict], have: list[dict],
+                 new_seasons: bool, zone) -> list[str]:
+    since = f"ab S{start[0]:02d}E{start[1]:02d}" if start else "ab jetzt (nur was noch kommt)"
+    lines = [f"📺 **{label}** wird verfolgt, {since}."]
+    if get:
+        lines.append(f"🔎 **Schon erschienen, wird jetzt geholt:** {episodes_text(get)}")
+    dated = sorted((e for e in later if parse_time(e.get("airDateUtc"))), key=lambda e: e["airDateUtc"])
+    if dated:
+        first, last = dated[0], dated[-1]
+        line = (f"📅 **Nächste Folge: {when_text(parse_time(first['airDateUtc']), zone)}** "  # type: ignore[arg-type]
+                f"(S{first['seasonNumber']:02d}E{first['episodeNumber']:02d})")
+        if len(dated) > 1:
+            line += f", danach {len(dated) - 1} weitere bis {when_text(parse_time(last['airDateUtc']), zone)[:9]}"  # type: ignore[arg-type]
+        lines.append(line.rstrip(".") + ". Jede kommt von selbst, sobald sie draussen ist.")
+    elif later:
+        lines.append(f"📅 {len(later)} angekündigte Folgen ohne Datum, Sonarr holt sie, sobald sie erscheinen.")
+    elif not get:
+        lines.append("📭 Im Moment ist keine neue Folge angekündigt." if not have else "✅ Alles ab dort ist schon da.")
+    if have and (get or later):
+        lines.append(f"✅ Schon da: {episodes_text(have)}")
+    lines.append("🆕 Neue Staffeln werden auch geholt." if new_seasons else "Neue Staffeln werden nicht automatisch geholt.")
+    return lines
+
+
+def calendar_lines(episodes: list[dict], movies: list[dict], loading: set[int], loading_movies: set[int],
+                   start: datetime, end: datetime, now: datetime, zone) -> list[str]:
+    """/kalender, by day: monitored episodes with time and state, movies on their digital release day."""
+    entries: list[tuple[datetime, bool, str]] = []  # (when, has a time, line)
+    for e in episodes:
+        when = parse_time(e.get("airDateUtc"))
+        show = e.get("series") if isinstance(e.get("series"), dict) else {}
+        if when is None or not start <= when < end or not isinstance(e.get("seasonNumber"), int):
+            continue
+        what = f"S{e['seasonNumber']:02d}E{e.get('episodeNumber', 0):02d}"
+        if isinstance(e.get("absoluteEpisodeNumber"), int) and show.get("seriesType") == "anime":
+            what += f" (Folge {e['absoluteEpisodeNumber']})"
+        if e.get("hasFile"):
+            state = "✅ da"
+        elif e.get("id") in loading:
+            state = "⬇️ lädt"
+        elif when <= now:
+            state = "🔎 wird gesucht"
+        else:
+            state = "⏳ wird geholt"
+        entries.append((when, True, f"📺 {show.get('title', '?')} · {what} · {state}"))
+    for m in movies:
+        when = parse_time(m.get("digitalRelease"))
+        if when is None or not start <= when < end:
+            continue
+        state = "✅ da" if m.get("hasFile") else "⬇️ lädt" if m.get("id") in loading_movies else "⏳ wird geholt"
+        year = f" ({m['year']})" if m.get("year") else ""
+        entries.append((when, False, f"🎬 {m.get('title', '?')}{year} · erscheint digital · {state}"))
+    lines: list[str] = []
+    day = None
+    for when, timed, line in sorted(entries, key=lambda x: x[0]):
+        local = when.astimezone(zone)
+        if local.date() != day:
+            if day is not None:
+                lines.append("")  # empty line between days
+            day = local.date()
+            lines.append(f"**{WEEKDAYS_SHORT[local.weekday()]} {local:%d.%m.}**")
+        lines.append((f"`{local:%H:%M}` " if timed else "") + line)
+    return lines

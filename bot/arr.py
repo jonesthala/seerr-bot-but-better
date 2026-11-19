@@ -5,11 +5,13 @@
   their state, and whether a search is running
 - /folgen: the shows and their episodes; monitor single episodes and search them
 - after watching: delete single episode files and stop monitoring them, so they aren't fetched again
+- /verfolgen: add a show without its old episodes, follow it from an episode on, stop again; /kalender
 """
 from __future__ import annotations
 
 import json
 import logging
+import time
 import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -203,6 +205,92 @@ class ArrClient:
             freed += info.get("size") or 0 if isinstance(info, dict) else 0
             self._request("DELETE", f"/episodefile/{file_id}")
         return freed
+
+    def lookup_tvdb(self, tvdb_id: int) -> dict | None:
+        """A show as Sonarr would add it, found by its TVDB id."""
+        found = self._get("/series/lookup", {"term": f"tvdb:{tvdb_id}"})
+        return next((s for s in found or [] if isinstance(s, dict) and s.get("tvdbId") == tvdb_id), None)
+
+    def add_series(self, lookup: dict, profile_id: int, root: str, anime: bool, new_seasons: bool) -> dict:
+        """Adds a show without monitoring or searching any episode. Sonarr still monitored all episodes once
+        (19.11., Dexter), so follow() with only_these=True unmonitors everything that isn't wanted afterwards."""
+        show = {**lookup, "qualityProfileId": profile_id, "rootFolderPath": root, "monitored": True, "seasonFolder": True,
+                "seriesType": "anime" if anime else "standard", "monitorNewItems": "all" if new_seasons else "none",
+                "seasons": [{**s, "monitored": False} for s in lookup.get("seasons") or [] if isinstance(s, dict)],
+                "addOptions": {"monitor": "none", "searchForMissingEpisodes": False, "searchForCutoffUnmetEpisodes": False}}
+        added = self._request("POST", "/series", body=show)
+        if not isinstance(added, dict) or not isinstance(added.get("id"), int):
+            raise ArrError("Sonarr hat die Serie nicht angenommen.")
+        return added
+
+    def wait_for_episodes(self, series_id: int, tries: int = 20, delay: float = 3.0, sleep=time.sleep) -> list[dict]:
+        """Right after adding, Sonarr loads the episode list in the background."""
+        for attempt in range(tries):
+            episodes = self.episodes(series_id)
+            if any(isinstance(e.get("seasonNumber"), int) and e["seasonNumber"] > 0 for e in episodes):
+                return episodes
+            if attempt < tries - 1:
+                sleep(delay)
+        return []
+
+    def follow(self, series: dict, episodes: list[dict], start: tuple[int, int] | None, now: datetime,
+               new_seasons: bool, only_these: bool = False) -> tuple[list[dict], list[dict], list[dict]]:
+        """/verfolgen: monitors the episodes from start on (None: only those still to come), searches those that
+        are out but missing, and new seasons if wanted. only_these (a show just added): every other episode is
+        unmonitored. Returns (searched now, still to come, already there)."""
+        wanted = []
+        for e in episodes:
+            season, number = e.get("seasonNumber"), e.get("episodeNumber")
+            if not isinstance(season, int) or season <= 0 or not isinstance(number, int) or not isinstance(e.get("id"), int):
+                continue
+            aired = parse_time(e.get("airDateUtc"))
+            if (start is not None and (season, number) >= start) or (start is None and (aired is None or aired > now)):
+                wanted.append(e)
+        ids = {e["id"] for e in wanted}
+        if only_these:
+            others = [e["id"] for e in episodes if isinstance(e.get("id"), int) and e["id"] not in ids and e.get("monitored")]
+            if others:
+                self._request("PUT", "/episode/monitor", body={"episodeIds": others, "monitored": False})
+        changes: dict[str, Any] = {}
+        if not series.get("monitored"):
+            changes["monitored"] = True
+        if (series.get("monitorNewItems") == "all") != new_seasons:
+            changes["monitorNewItems"] = "all" if new_seasons else "none"
+        if changes:
+            self._request("PUT", f"/series/{series['id']}", body={**series, **changes})
+        if ids:
+            self._request("PUT", "/episode/monitor", body={"episodeIds": sorted(ids), "monitored": True})
+        get = [e for e in wanted if not e.get("hasFile") and (t := parse_time(e.get("airDateUtc"))) is not None and t <= now]
+        later = [e for e in wanted if not e.get("hasFile") and e not in get]
+        have = [e for e in wanted if e.get("hasFile")]
+        if get:
+            self._request("POST", "/command", body={"name": "EpisodeSearch", "episodeIds": [e["id"] for e in get]})
+        return get, later, have
+
+    def unfollow(self, series: dict, now: datetime) -> int:
+        """Stops fetching what is still to come (and new seasons); files that are there stay."""
+        future = [e["id"] for e in self.episodes(series["id"])
+                  if isinstance(e.get("id"), int) and e.get("monitored") and not e.get("hasFile")
+                  and ((t := parse_time(e.get("airDateUtc"))) is None or t > now)]
+        if future:
+            self._request("PUT", "/episode/monitor", body={"episodeIds": future, "monitored": False})
+        if series.get("monitorNewItems") != "none":
+            self._request("PUT", f"/series/{series['id']}", body={**series, "monitorNewItems": "none"})
+        return len(future)
+
+    def calendar(self, start: datetime, end: datetime) -> list[dict]:
+        """Monitored episodes (Sonarr) or movies (Radarr) coming out between start and end."""
+        query = {"start": start.isoformat(), "end": end.isoformat(), "unmonitored": "false"}
+        if self.kind == "tv":
+            query["includeSeries"] = "true"
+        return [i for i in self._get("/calendar", query) or [] if isinstance(i, dict)]
+
+    def queued_ids(self) -> set[int]:
+        """Episode ids (Sonarr) or movie ids (Radarr) that are downloading or importing."""
+        data = self._get("/queue", {"pageSize": 500})
+        key = "episodeId" if self.kind == "tv" else "movieId"
+        records = data.get("records") if isinstance(data, dict) else None
+        return {r[key] for r in records or [] if isinstance(r, dict) and isinstance(r.get(key), int)}
 
     def queued_titles(self) -> dict[int, str]:
         """TMDB id → 'Name (Jahr)' of everything in the download queue (for /status, also without a request)."""

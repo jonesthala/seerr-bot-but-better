@@ -52,6 +52,14 @@ to Radarr or Sonarr as usual.
 - **`/abo <serie>`** (needs the Jellyfin setup below): subscribe to a show in the library and get a DM when new
   episodes arrive in Jellyfin, grouped by season. Choosing the show again ends it; without a show it lists
   your subscriptions. Episodes already there when subscribing are not announced.
+- **`/verfolgen <serie> [ab] [neue_staffeln] [stopp]`** (needs Sonarr): follow a show from an episode on, e.g.
+  `/verfolgen Dexter ab S02E04` (or `1181` for anime; without `ab` only what is still to come). Shows that aren't
+  in Sonarr yet are added without their old episodes, with Seerr's quality profile and folder. Every new episode is
+  fetched when it comes out, optionally new seasons too, and the follower gets an automatic `/abo`. The answer says
+  when the next episode comes. Admins follow directly; for everyone else an admin approves it with buttons. Without
+  a show it lists what you follow; `stopp:True` stops fetching what is still to come (files stay).
+- **`/kalender [tage] [mein]`** (needs Sonarr): the coming days, by day: monitored episodes with time and state
+  (fetched, downloading, there) and movies on their digital release; `mein` only shows you follow or subscribed to.
 - **`/zufall [Filme|Serien] [genre]`** (needs the Jellyfin setup): a movie or show from the library that wasn't
   watched yet (by you if you have a Jellyfin account through the bot, else by anyone), with a *Nochmal* button.
 - **`/filmabend <titel> <zeit>`** (needs the Jellyfin setup): creates a Discord event (`20:00`, `morgen 20:15`,

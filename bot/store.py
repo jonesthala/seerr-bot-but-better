@@ -84,6 +84,24 @@ class WatchQuestion:
     answer: str = ""
 
 
+@dataclass
+class Follow:
+    """/verfolgen: someone follows a show from an episode on, or only what is still to come."""
+    user_id: int
+    user_name: str
+    tmdb_id: int
+    label: str
+    start_text: str = ""  # "S02E04", "1181", or empty: only what is still to come
+    new_seasons: bool = True
+    state: str = "pending"  # pending (waits for an admin), active, declined
+    fid: int = 0
+    created: float = 0.0
+    series_id: int = 0  # Sonarr, once followed
+    card_text: str = ""  # the approval message
+    channel_id: int = 0
+    message_id: int = 0
+
+
 def _load_items(cls: type, items: Any) -> list:
     names = {f.name for f in fields(cls)}
     loaded = []
@@ -117,6 +135,7 @@ class Store:
         self.watch_since = ""
         self.watch_asked: list[str] = []
         self.watch_questions: dict[int, WatchQuestion] = {}
+        self.follows: dict[int, Follow] = {}  # /verfolgen
         self._load()
 
     # --- file ------------------------------------------------------------------
@@ -154,6 +173,7 @@ class Store:
         self.watch_since = str(watched.get("since") or "")
         self.watch_asked = [str(i) for i in watched.get("asked") or [] if isinstance(i, str)]
         self.watch_questions = {q.qid: q for q in _load_items(WatchQuestion, watched.get("questions"))}
+        self.follows = {f.fid: f for f in _load_items(Follow, data.get("follows"))}
 
     def save(self) -> None:
         if self.path is None:
@@ -169,6 +189,7 @@ class Store:
             "brake": {"active": self.brake_active, "hashes": self.brake_hashes},
             "watched": {"since": self.watch_since, "asked": self.watch_asked,
                         "questions": [asdict(q) for q in self.watch_questions.values()]},
+            "follows": [asdict(f) for f in self.follows.values()],
         }
         tmp = None
         try:
@@ -193,6 +214,7 @@ class Store:
         old = self._now() - KEEP_QUESTIONS_DAYS * 86400
         self.watch_questions = {k: q for k, q in self.watch_questions.items() if q.state == "open" or q.created >= old}
         self.watch_asked = self.watch_asked[-KEEP_WATCHED_IDS:]
+        self.follows = {k: f for k, f in self.follows.items() if f.state != "declined" or f.created >= old}
         closed = sorted(k for k, a in self.approvals.items() if a.closed)
         for key in closed[:-KEEP_APPROVALS] if len(closed) > KEEP_APPROVALS else []:
             del self.approvals[key]
@@ -341,6 +363,22 @@ class Store:
         self.watch_asked += [i for i in question.item_ids if i not in self.watch_asked]
         self.save()
         return question
+
+    # --- /verfolgen -------------------------------------------------------------------
+    def add_follow(self, follow: Follow) -> Follow:
+        follow.fid = max(self.follows, default=0) + 1
+        follow.created = self._now()
+        self.follows[follow.fid] = follow
+        self.save()
+        return follow
+
+    def active_follows(self, user_id: int | None = None, tmdb_id: int | None = None) -> list[Follow]:
+        return [f for f in self.follows.values() if f.state == "active"
+                and (user_id is None or f.user_id == user_id) and (tmdb_id is None or f.tmdb_id == tmdb_id)]
+
+    def drop_follow(self, fid: int) -> None:
+        self.follows.pop(fid, None)
+        self.save()
 
     def set_watch_since(self, when: str) -> None:
         self.watch_since = when

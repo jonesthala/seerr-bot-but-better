@@ -75,7 +75,12 @@ from .extras import (
     event_description,
     event_end,
     episodes_deleted_text,
+    calendar_lines,
+    follow_lines,
     item_label,
+    parse_start,
+    start_episode,
+    when_text,
     parse_episodes,
     parse_when,
     per_episode_estimate,
@@ -89,7 +94,7 @@ from .extras import (
 )
 from .torrents import QbitClient, TorrentCleaner, TorrentError
 from .store import (FRIEND_APPROVED, FRIEND_DECLINED, FRIEND_PENDING, FRIEND_REVOKED, Approval, Friend, Store,
-                    WatchQuestion)
+                    Follow, WatchQuestion)
 
 log = logging.getLogger("seerrbot.discord")
 
@@ -232,7 +237,8 @@ class SeerrBot(discord.Client):
         for command in build_commands(self):
             self.tree.add_command(command, guild=guild)
         await self.tree.sync(guild=guild)
-        self.add_dynamic_items(ApprovalButton, FriendButton, LoginButton, StatusRefresh, WatchedButton)  # after a restart
+        self.add_dynamic_items(ApprovalButton, FriendButton, LoginButton, StatusRefresh, WatchedButton,
+                               FollowButton)  # after a restart
         await self.load_profiles()
         self.space_loop.start()
         self.watch_loop.start()
@@ -647,6 +653,83 @@ class SeerrBot(discord.Client):
             sent.append([message.channel.id, message.id])
         return sent
 
+    async def run_follow(self, follow: Follow) -> tuple[bool, str]:
+        """/verfolgen: adds the show to Sonarr if needed (without its old episodes) and follows it. (done, text)"""
+        sonarr = self.arrs["tv"]
+        now = datetime.now(timezone.utc)
+        series = next((s for s in await asyncio.to_thread(sonarr.series) if s.get("tmdbId") == follow.tmdb_id), None)
+        added = False
+        if series is None:
+            tvdb, anime, _ = await asyncio.to_thread(self.seerr.show_ids, follow.tmdb_id)
+            defaults = await asyncio.to_thread(self.seerr.sonarr_defaults)
+            lookup = await asyncio.to_thread(sonarr.lookup_tvdb, tvdb) if tvdb else None
+            if lookup is None or defaults is None:
+                return False, ("⚠️ Sonarr findet diese Serie nicht (TMDB kennt keine TVDB-Nummer), oder in Seerr ist kein "
+                               "Sonarr eingerichtet.")
+            profile, folder, anime_profile, anime_folder = defaults
+            series = await asyncio.to_thread(sonarr.add_series, lookup, anime_profile if anime else profile,
+                                             anime_folder if anime else folder, anime, follow.new_seasons)
+            added = True
+            episodes = await asyncio.to_thread(sonarr.wait_for_episodes, series["id"])
+        else:
+            episodes = await asyncio.to_thread(sonarr.episodes, series["id"])
+        if not episodes:
+            return False, "⚠️ Sonarr hat die Folgen noch nicht geladen. Versuch es in einer Minute nochmals."
+        try:
+            start = start_episode(parse_start(follow.start_text), episodes)
+        except ValueError as error:
+            if added:  # nothing of the new show may stay monitored
+                await asyncio.to_thread(sonarr.follow, series, episodes, (10**6, 0), now, False, True)
+            return False, f"⚠️ {error}"
+        get, later, have = await asyncio.to_thread(sonarr.follow, series, episodes, start, now, follow.new_seasons, added)
+        follow.series_id, follow.state = series["id"], "active"
+        for older in self.store.active_follows(user_id=follow.user_id, tmdb_id=follow.tmdb_id):
+            if older.fid != follow.fid:
+                self.store.drop_follow(older.fid)
+        self.store.save()
+        lines = follow_lines(escape(follow.label), start, get, later, have, follow.new_seasons, self.settings.zone)
+        note = await self.auto_abo(follow.user_id, Title("tv", follow.tmdb_id, follow.label, "", "", None, 0))
+        return True, "\n".join(lines + ([note] if note else []))
+
+    async def stop_follow(self, user_id: int, admin: bool, tmdb_id: int, label: str) -> str:
+        """/verfolgen … stopp: this person stops; if nobody follows any more, Sonarr stops fetching what is to come."""
+        mine = self.store.active_follows(user_id=user_id, tmdb_id=tmdb_id)
+        if not mine and not admin:
+            return f"ℹ️ Du verfolgst **{escape(label)}** nicht."
+        for follow in mine:
+            self.store.drop_follow(follow.fid)
+        if self.store.active_follows(tmdb_id=tmdb_id):
+            return (f"⏹️ Du verfolgst **{escape(label)}** nicht mehr. Andere verfolgen die Serie weiter, darum holt Sonarr "
+                    "die neuen Folgen weiter.")
+        sonarr = self.arrs["tv"]
+        series = next((s for s in await asyncio.to_thread(sonarr.series) if s.get("tmdbId") == tmdb_id), None)
+        if series is None:
+            return f"ℹ️ **{escape(label)}** ist nicht in Sonarr."
+        count = await asyncio.to_thread(sonarr.unfollow, series, datetime.now(timezone.utc))
+        return (f"⏹️ **{escape(label)}** wird nicht mehr verfolgt: {count} angekündigte Folgen und neue Staffeln werden "
+                "nicht geholt. Was schon da ist, bleibt (löschen mit `/löschen`).")
+
+    async def follow_list(self, user_id: int, admin: bool) -> str:
+        """/verfolgen without a show: what this person follows (admins: everything), with the next episode."""
+        follows = self.store.active_follows() if admin else self.store.active_follows(user_id=user_id)
+        if not follows:
+            return "📭 Du verfolgst keine Serie. Zum Beispiel: `/verfolgen Dexter ab S02E04`."
+        now = datetime.now(timezone.utc)
+        upcoming = await asyncio.to_thread(self.arrs["tv"].calendar, now, now + timedelta(days=120))
+        first: dict[int, dict] = {}
+        for e in sorted(upcoming, key=lambda e: str(e.get("airDateUtc"))):
+            first.setdefault(e.get("seriesId"), e)
+        lines = []
+        for follow in sorted(follows, key=lambda f: f.label.casefold()):
+            e = first.get(follow.series_id)
+            when = parse_time(e.get("airDateUtc")) if e else None
+            nxt = (f"nächste Folge {when_text(when, self.settings.zone)} (S{e['seasonNumber']:02d}E{e['episodeNumber']:02d})"
+                   if e and when else "keine neue Folge angekündigt")
+            since = f"ab {escape(follow.start_text)}" if follow.start_text else "ab Start"
+            who = f" · {escape(follow.user_name)}" if admin and follow.user_id != user_id else ""
+            lines.append(f"📺 **{escape(follow.label)}** · {since} · {nxt}{who}")
+        return "\n".join(lines)
+
     async def status_embeds(self) -> list[discord.Embed]:
         """/status: a summary card, then one card per open request with bars, episodes and downloads, then
         downloads without a request in Seerr (from /folgen or added in Sonarr/Radarr directly)."""
@@ -879,6 +962,62 @@ async def handle_approval(interaction: discord.Interaction, request_id: int, act
 
 
 # --- /status refresh (persistent, anyone may click) ---------------------------------------------
+class FollowButton(discord.ui.DynamicItem[discord.ui.Button], template=r"follow:(?P<action>ok|no):(?P<id>[0-9]+)"):
+    """Freigeben / Ablehnen when someone who isn't admin wants to follow a show; works after a restart."""
+
+    def __init__(self, follow_id: int, action: str) -> None:
+        ok = action == "ok"
+        super().__init__(discord.ui.Button(
+            label="Freigeben" if ok else "Ablehnen", emoji="✅" if ok else "❌",
+            style=discord.ButtonStyle.success if ok else discord.ButtonStyle.secondary,
+            custom_id=f"follow:{action}:{follow_id}"))
+        self.follow_id, self.action = follow_id, action
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match[str]):
+        return cls(int(match["id"]), match["action"])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await handle_follow_decision(interaction, self.follow_id, self.action)
+
+
+def follow_view(follow_id: int) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(FollowButton(follow_id, "ok"))
+    view.add_item(FollowButton(follow_id, "no"))
+    return view
+
+
+async def handle_follow_decision(interaction: discord.Interaction, follow_id: int, action: str) -> None:
+    bot: SeerrBot = interaction.client  # type: ignore[assignment]
+    if not bot.is_admin(interaction):
+        await interaction.response.send_message(NO_APPROVE, ephemeral=True)
+        return
+    follow = bot.store.follows.get(follow_id)
+    if follow is None or follow.state != "pending":
+        await interaction.response.edit_message(view=None)
+        return
+    await interaction.response.defer()
+    who = escape(interaction.user.display_name)
+    if action == "no":
+        follow.state = "declined"
+        bot.store.save()
+        result = f"❌ Abgelehnt von {who}."
+        await bot.tell(follow.user_id, f"❌ **{escape(follow.label)}** zu verfolgen wurde abgelehnt.")
+    else:
+        try:
+            ok, text = await bot.run_follow(follow)
+        except (SeerrError, ArrError) as error:
+            await report_error(interaction, error)
+            return
+        if not ok:
+            await interaction.followup.send(text, ephemeral=True)
+            return
+        result = f"✅ Freigegeben von {who}.\n{text}"
+        await bot.tell(follow.user_id, f"✅ Freigegeben:\n{text}")
+    await interaction.edit_original_response(content=f"{follow.card_text}\n\n{result}"[:2000], view=None)
+
+
 class WatchedButton(discord.ui.DynamicItem[discord.ui.Button], template=r"watched:(?P<action>del|keep):(?P<id>[0-9]+)"):
     """Löschen / Behalten under a 'Geschaut' question; works after a restart."""
 
@@ -2007,9 +2146,123 @@ def extra_commands(bot: SeerrBot, requester) -> list[app_commands.Command]:
             view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="In Jellyfin", emoji="▶️", url=link))
         await interaction.followup.send(embed=embed, view=view)
 
+    async def suggest_follow(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        """Shows in Sonarr, and (from Seerr's search) shows that aren't there yet."""
+        text = current.strip()
+
+        async def search() -> list[Title]:
+            return await asyncio.to_thread(bot.seerr.search, text, "tv") if len(text) >= 2 else []
+        shows, found = await asyncio.gather(asyncio.wait_for(bot.sonarr_series(), AUTOCOMPLETE_SECONDS),
+                                            asyncio.wait_for(search(), AUTOCOMPLETE_SECONDS), return_exceptions=True)
+        shows = shows if isinstance(shows, list) else []
+        found = found if isinstance(found, list) else []
+        known = {s.get("tmdbId") for s in shows}
+        choices = [app_commands.Choice(name=shorten(f"{s.get('title', '?')} ({s.get('year')}) · in Sonarr", 100),
+                                       value=f"s:{s['id']}")
+                   for s in shows if text.casefold() in str(s.get("title", "")).casefold()]
+        choices += [app_commands.Choice(name=shorten(f"{t.label} · neu", 100), value=f"t:{t.tmdb_id}")
+                    for t in found if t.tmdb_id not in known]
+        return choices[:25]
+
+    async def resolve_show(text: str) -> tuple[int, str] | None:
+        """(TMDB id, name) of a picked suggestion or typed name: Sonarr first, then Seerr's search."""
+        value = text.strip()
+        shows = await bot.sonarr_series()
+        if value.startswith("s:") and value[2:].isdigit():
+            show = next((s for s in shows if s.get("id") == int(value[2:])), None)
+        else:
+            show = next((s for s in shows if str(s.get("title", "")).casefold().startswith(value.casefold())), None)
+        if show is not None and isinstance(show.get("tmdbId"), int) and show["tmdbId"] > 0:
+            year = show.get("year")
+            return show["tmdbId"], f"{show.get('title', '?')} ({year})" if year else str(show.get("title", "?"))
+        if value.startswith("t:") and value[2:].isdigit():
+            title = await asyncio.to_thread(bot.seerr.details, "tv", int(value[2:]))
+            return title.tmdb_id, title.label
+        found = await asyncio.to_thread(bot.seerr.search, value, "tv")
+        return (found[0].tmdb_id, found[0].label) if found else None
+
+    @app_commands.command(name="verfolgen", description="Serie ab einer Folge verfolgen: jede neue Folge kommt von selbst")
+    @app_commands.describe(serie="Die Serie. Leer lassen: was du verfolgst",
+                           ab="Ab welcher Folge, z.B. S02E04, bei Anime auch 1181. Leer: nur was noch kommt",
+                           neue_staffeln="Auch neue Staffeln holen (Standard: ja)",
+                           stopp="Verfolgen beenden: angekündigte Folgen werden nicht mehr geholt")
+    @app_commands.autocomplete(serie=suggest_follow)
+    @app_commands.check(requester)
+    async def verfolgen(interaction: discord.Interaction, serie: Optional[str] = None, ab: Optional[str] = None,
+                        neue_staffeln: Optional[bool] = None, stopp: Optional[bool] = None) -> None:
+        await interaction.response.defer(thinking=True)
+        admin = bot.is_admin(interaction) or not bot.settings.has_admins
+        if serie is None:
+            embed = discord.Embed(title="📺 Verfolgte Serien", description=(await bot.follow_list(interaction.user.id, admin))[:4000],
+                                  color=discord.Color.teal())
+            await interaction.followup.send(embed=embed)
+            return
+        show = await resolve_show(serie)
+        if show is None:
+            await interaction.followup.send(f"🔎 Keine Serie gefunden für **{escape(serie.strip())}**.")
+            return
+        tmdb_id, label = show
+        if stopp:
+            await interaction.followup.send(await bot.stop_follow(interaction.user.id, admin, tmdb_id, label))
+            return
+        try:
+            parse_start(ab)  # only the form; absolute numbers are checked against Sonarr later
+        except ValueError as error:
+            await interaction.followup.send(f"⚠️ {error}")
+            return
+        follow = Follow(interaction.user.id, interaction.user.display_name, tmdb_id, label, (ab or "").strip(),
+                        True if neue_staffeln is None else neue_staffeln)
+        if admin:
+            ok, text = await bot.run_follow(follow)
+            if ok:
+                bot.store.add_follow(follow)
+            await interaction.followup.send(text)
+            return
+        since = f"ab {escape(follow.start_text)}" if follow.start_text else "ab jetzt"
+        follow.card_text = (f"📺 **{escape(interaction.user.display_name)}** möchte **{escape(label)}** verfolgen, {since}"
+                            f"{', mit neuen Staffeln' if follow.new_seasons else ''}. Neue Folgen kommen dann von selbst.")
+        follow = bot.store.add_follow(follow)
+        message = await bot.post(follow.card_text, view=follow_view(follow.fid), channel_id=bot.settings.approvals_channel)
+        follow.channel_id, follow.message_id = message.channel.id, message.id
+        bot.store.save()
+        await interaction.followup.send(f"⏳ **{escape(label)}** verfolgen: Ein Admin muss das zuerst freigeben, du bekommst "
+                                        "dann Bescheid.")
+
+    @app_commands.command(name="kalender", description="Welche Folgen und Filme in den nächsten Tagen kommen und geholt werden")
+    @app_commands.describe(tage="Wie viele Tage (Standard 7)", mein="Nur Serien, die du verfolgst oder abonniert hast")
+    async def kalender(interaction: discord.Interaction, tage: Optional[app_commands.Range[int, 1, 31]] = None,
+                       mein: Optional[bool] = None) -> None:
+        await interaction.response.defer(thinking=True)
+        days = tage or 7
+        now = datetime.now(timezone.utc)
+        today = datetime.now(bot.settings.zone).replace(hour=0, minute=0, second=0, microsecond=0)
+        start, end = today.astimezone(timezone.utc), (today + timedelta(days=days)).astimezone(timezone.utc)
+        sonarr, radarr = bot.arrs["tv"], bot.arrs.get("movie")
+        episodes = await asyncio.to_thread(sonarr.calendar, start, end)
+        loading = await asyncio.to_thread(sonarr.queued_ids)
+        movies: list[dict] = []
+        loading_movies: set[int] = set()
+        if radarr is not None:
+            movies = await asyncio.to_thread(radarr.calendar, start, end)
+            loading_movies = await asyncio.to_thread(radarr.queued_ids)
+        if mein:
+            user_id = interaction.user.id
+            mine = {f.tmdb_id for f in bot.store.active_follows(user_id=user_id)}
+            abos = set(bot.store.user_abos(user_id))
+            mine |= {tmdb for sid, _, tmdb in await bot.series_list() if sid in abos and tmdb}
+            episodes = [e for e in episodes if (e.get("series") or {}).get("tmdbId") in mine]
+            asked = {r.tmdb_id for r in bot.store.requests.values() if r.kind == "movie" and r.user_id == user_id}
+            movies = [m for m in movies if m.get("tmdbId") in asked]
+        lines = calendar_lines(episodes, movies, loading, loading_movies, start, end, now, bot.settings.zone)
+        empty = "📭 Nichts, was du verfolgst oder abonniert hast." if mein else "📭 In dieser Zeit kommt nichts, was geholt wird."
+        embed = discord.Embed(title=f"🗓️ Die nächsten {days} Tage" + (" · nur deine" if mein else ""),
+                              description="\n".join(lines)[:4000] if lines else empty, color=discord.Color.teal())
+        embed.set_footer(text="Uhrzeiten in Ortszeit · neue Folgen holt Sonarr von selbst · Serien dazu: /verfolgen")
+        await interaction.followup.send(embed=embed)
+
     commands: list[app_commands.Command] = []
     if "tv" in bot.arrs:
-        commands.append(folgen)
+        commands += [folgen, verfolgen, kalender]
     if bot.jellyfin is not None:
         commands += [zufall, filmabend]
     return commands

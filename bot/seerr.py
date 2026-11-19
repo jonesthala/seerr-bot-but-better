@@ -36,6 +36,8 @@ from .core import (
     trending_results,
 )
 
+ANIME_KEYWORD = 210024  # TMDB keyword "anime", as Seerr uses it
+
 log = logging.getLogger("seerrbot.seerr")
 
 USER_AGENT = "seerr-discord-bot/1.0"
@@ -269,6 +271,26 @@ class SeerrClient:
         data = self._call("POST", "/issue", body=body)
         issue_id = data.get("id") if isinstance(data, dict) else None
         return issue_id if isinstance(issue_id, int) else None
+
+    def sonarr_defaults(self) -> tuple[int, str, int, str] | None:
+        """Quality profile and folder Seerr uses for shows, and for anime: (profile, folder, anime profile, folder)."""
+        server = pick_server(self._call("GET", "/service/sonarr"))
+        if server is None:
+            return None
+        profile, folder = server.get("activeProfileId"), server.get("activeDirectory")
+        if not isinstance(profile, int) or not folder:
+            return None
+        anime_profile = server.get("activeAnimeProfileId")
+        return (profile, str(folder), anime_profile if isinstance(anime_profile, int) else profile,
+                str(server.get("activeAnimeDirectory") or folder))
+
+    def show_ids(self, tmdb_id: int) -> tuple[int | None, bool, str]:
+        """For adding a show to Sonarr: its TVDB id, whether it is anime (TMDB keyword), and its name."""
+        data = self._call("GET", f"/tv/{tmdb_id}")
+        data = data if isinstance(data, dict) else {}
+        tvdb = (data.get("externalIds") or {}).get("tvdbId")
+        anime = any(isinstance(k, dict) and k.get("id") == ANIME_KEYWORD for k in data.get("keywords") or [])
+        return (tvdb if isinstance(tvdb, int) and tvdb > 0 else None), anime, str(data.get("name") or "")
 
     def sync_availability(self) -> None:
         """Starts Seerr's job that compares its library with Jellyfin and Sonarr/Radarr (marks deleted titles)."""
