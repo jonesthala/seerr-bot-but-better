@@ -103,6 +103,16 @@ class LinesTest(unittest.TestCase):
         self.assertEqual(lines[0], "📦 12 von 25 Folgen da · ⬇️ 1 laden · 🔎 4 fehlen · 📅 2 kommen noch")
         self.assertEqual(lines[-1], "🔎 Fehlen noch: Staffel 23: Folge 16–18, 20 · Sonarr sucht gerade")
 
+    def test_moving_first_paused_counted_apart(self):
+        downloads = tuple([Download(f"S01E{n:02d}", 10, 10, None, "paused", hash=f"p{n}", episodes=1) for n in range(1, 5)]
+                          + [Download("S01E09", 10, 2, None, "downloading", hash="a", episodes=1),
+                             Download("S01E08", 10, 8, None, "downloading", hash="b", episodes=1)])
+        lines = progress_lines("tv", Progress(0, 6, {}, 0, downloads, False), {}, NOW)
+        self.assertEqual(lines[0], "📦 0 von 6 Folgen da · ⬇️ 2 laden · ⏸️ 4 pausiert")
+        self.assertTrue(lines[1].startswith("⬇️ S01E09"))  # most progress first
+        self.assertTrue(lines[2].startswith("⬇️ S01E08"))
+        self.assertTrue(lines[3].startswith("⏸️"))
+
     def test_movie_lines(self):
         self.assertEqual(progress_lines("movie", Progress(0, 1, {}, 0, (), False), {}, NOW),
                          ["🔎 Radarr wartet auf ein passendes Release"])

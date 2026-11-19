@@ -20,6 +20,8 @@ log = logging.getLogger("seerrbot.arr")
 SEARCHES = {"EpisodeSearch", "SeasonSearch", "SeriesSearch", "MissingEpisodeSearch", "CutoffUnmetEpisodeSearch",
             "MoviesSearch", "MissingMoviesSearch", "CutoffUnmetMoviesSearch"}
 SHOWN_DOWNLOADS = 4  # per title in /status
+# order in /status: what is moving first, paused last
+STATE_ORDER = {"downloading": 0, "importing": 1, "queued": 2, "blocked": 3, "warning": 4, "stalled": 5, "failed": 6, "paused": 7}
 
 
 class ArrError(Exception):
@@ -242,13 +244,21 @@ def download_line(download: Download, live: dict | None, now: datetime) -> str:
 def progress_lines(kind: str, progress: Progress, live: dict[str, dict], now: datetime) -> list[str]:
     """The lines under a title in /status."""
     lines = []
-    shown = progress.downloads[:SHOWN_DOWNLOADS]
+    ordered = sorted(progress.downloads, key=lambda d: (STATE_ORDER.get(d.state, 9), -d.percent))
+    shown = ordered[:SHOWN_DOWNLOADS]
     if kind == "tv":
-        loading = sum(max(d.episodes, 1) for d in progress.downloads)
+        def count(*states: str) -> int:
+            return sum(max(d.episodes, 1) for d in progress.downloads if d.state in states)
+        loading = count("downloading", "queued", "importing")
+        paused, stuck = count("paused"), count("stalled", "blocked", "failed", "warning")
         missing = sum(len(v) for v in progress.missing.values())
         parts = [f"📦 {progress.have} von {progress.total} Folgen da"]
         if loading:
             parts.append(f"⬇️ {loading} laden")
+        if paused:
+            parts.append(f"⏸️ {paused} pausiert")
+        if stuck:
+            parts.append(f"⚠️ {stuck} hängen")
         if missing:
             parts.append(f"🔎 {missing} fehlen")
         if progress.upcoming:
