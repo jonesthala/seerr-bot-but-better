@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from .core import parse_time
+from .core import format_numbers, parse_time
 from .seerr import USER_AGENT, Fetch, http_fetch
 
 log = logging.getLogger("seerrbot.jellyfin")
@@ -188,6 +188,23 @@ class JellyfinClient:
                    for u in self.users() if u.get("Id")}
         return library_usage(files, series, watched)
 
+    def series_list(self) -> list[tuple[str, str]]:
+        """(Jellyfin id, 'Name (Jahr)') of every show in the library, by name (for /abo)."""
+        data = self._call("GET", "/Items", {"Recursive": "true", "IncludeItemTypes": "Series", "SortBy": "SortName"})
+        found = data.get("Items") if isinstance(data, dict) else None
+        return [(str(s["Id"]), _label(s)) for s in found or [] if isinstance(s, dict) and s.get("Id")]
+
+    def episodes(self, series_id: str) -> dict[str, str]:
+        """'S01E05' → episode title, for every episode of a show that is in the library."""
+        data = self._call("GET", "/Items", {"Recursive": "true", "IncludeItemTypes": "Episode", "ParentId": series_id})
+        found = data.get("Items") if isinstance(data, dict) else None
+        keys = {}
+        for item in found or []:
+            key = episode_key(item) if isinstance(item, dict) else None
+            if key:
+                keys[key] = str(item.get("Name") or "")
+        return keys
+
     def folder_ids(self) -> list[str]:
         """Ids of the libraries friends may see (JELLYFIN_FRIEND_LIBRARIES); all if none are named."""
         data = self._call("GET", "/Library/VirtualFolders")
@@ -236,6 +253,27 @@ class JellyfinClient:
         password = new_password()
         self._call("POST", "/Users/Password", {"userId": user_id}, body={"NewPw": password, "ResetPassword": False})
         return password
+
+
+def episode_key(item: dict) -> str | None:
+    """'S01E05' for an episode, None if Jellyfin doesn't know its numbers."""
+    season, episode = item.get("ParentIndexNumber"), item.get("IndexNumber")
+    if not isinstance(season, int) or not isinstance(episode, int):
+        return None
+    return f"S{season:02d}E{episode:02d}"
+
+
+def new_episodes_text(show: str, new: dict[str, str]) -> str:
+    """The DM for subscribers: one episode with its title, or several grouped by season."""
+    if len(new) == 1:
+        key, title = next(iter(new.items()))
+        return f"📺 Neue Folge von **{show}**: {key}" + (f" «{title}»" if title else "") + " ist jetzt in Jellyfin."
+    seasons: dict[int, list[int]] = {}
+    for key in new:
+        season, episode = re.fullmatch(r"S(\d+)E(\d+)", key).groups()  # type: ignore[union-attr]
+        seasons.setdefault(int(season), []).append(int(episode))
+    parts = [f"Staffel {s}: Folge {format_numbers(numbers)}" for s, numbers in sorted(seasons.items())]
+    return f"📺 **{len(new)} neue Folgen** von **{show}** sind jetzt in Jellyfin ({'; '.join(parts)})."
 
 
 def usage_line(rank: int, usage: Usage, size: str, who: str | None, zone: Any) -> str:

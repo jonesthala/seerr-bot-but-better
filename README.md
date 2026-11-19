@@ -40,6 +40,10 @@ to Radarr or Sonarr as usual.
   time left), who asked for it, and free space.
 - **`/neu`**: what came into the library last, with links. Optionally as a **weekly post** in the channel.
 - **`/problem <titel>`**: report a problem (picture, sound, subtitles, other) as an issue in Seerr.
+- **`/hilfe`**: the commands this person may use, each with an example. Admin commands only for admins.
+- **`/abo <serie>`** (needs the Jellyfin setup below): subscribe to a show in the library and get a DM when new
+  episodes arrive in Jellyfin, grouped by season. Choosing the show again ends it; without a show it lists
+  your subscriptions. Episodes already there when subscribing are not announced.
 
 **Housekeeping**
 - **Watches the disk.** Below `MIN_FREE_GB` free, new requests are refused with a clear message, and the

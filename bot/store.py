@@ -82,6 +82,10 @@ class Store:
         self.requests: dict[int, Tracked] = {}
         self.approvals: dict[int, Approval] = {}
         self.friends: dict[int, Friend] = {}
+        # /abo: Discord user → Jellyfin series ids; per series its name and the episodes already announced
+        self.abos: dict[int, list[str]] = {}
+        self.abo_names: dict[str, str] = {}
+        self.abo_known: dict[str, list[str]] = {}
         self.digest = ""
         self._load()
 
@@ -102,6 +106,13 @@ class Store:
         self.requests = {t.request_id: t for t in _load_items(Tracked, data.get("requests"))}
         self.approvals = {a.request_id: a for a in _load_items(Approval, data.get("approvals"))}
         self.friends = {f.user_id: f for f in _load_items(Friend, data.get("friends"))}
+        abos = data.get("abos") if isinstance(data.get("abos"), dict) else {}
+        users = abos.get("users") if isinstance(abos.get("users"), dict) else {}
+        self.abos = {int(k): [str(s) for s in v] for k, v in users.items() if str(k).isdigit() and isinstance(v, list)}
+        names, known = abos.get("names"), abos.get("known")
+        self.abo_names = {str(k): str(v) for k, v in names.items()} if isinstance(names, dict) else {}
+        self.abo_known = {str(k): [str(e) for e in v] for k, v in known.items() if isinstance(v, list)} \
+            if isinstance(known, dict) else {}
         self.digest = str(data.get("digest") or "")
 
     def save(self) -> None:
@@ -112,6 +123,7 @@ class Store:
             "requests": [asdict(t) for t in self.requests.values()],
             "approvals": [asdict(a) for a in self.approvals.values()],
             "friends": [asdict(f) for f in self.friends.values()],
+            "abos": {"users": {str(k): v for k, v in self.abos.items()}, "names": self.abo_names, "known": self.abo_known},
             "digest": self.digest,
         }
         tmp = None
@@ -192,6 +204,45 @@ class Store:
         wanted = name.casefold()
         return any(f.jellyfin_name.casefold() == wanted and f.user_id != user_id
                    and f.state != FRIEND_DECLINED for f in self.friends.values())
+
+    # --- /abo: new episodes of a show --------------------------------------------------
+    def toggle_abo(self, user_id: int, series_id: str, name: str, known: list[str]) -> bool:
+        """Subscribes, or unsubscribes if already subscribed. Returns True if subscribed now.
+        known: the episodes there right now, so they aren't announced as new."""
+        mine = self.abos.setdefault(user_id, [])
+        if series_id in mine:
+            mine.remove(series_id)
+            if not mine:
+                del self.abos[user_id]
+            if not self.subscribers(series_id):  # nobody follows it any more
+                self.abo_names.pop(series_id, None)
+                self.abo_known.pop(series_id, None)
+            self.save()
+            return False
+        mine.append(series_id)
+        self.abo_names[series_id] = name
+        if series_id not in self.abo_known:
+            self.abo_known[series_id] = sorted(known)
+        self.save()
+        return True
+
+    def user_abos(self, user_id: int) -> list[str]:
+        return list(self.abos.get(user_id, []))
+
+    def subscribers(self, series_id: str) -> list[int]:
+        return sorted(user for user, shows in self.abos.items() if series_id in shows)
+
+    def subscribed_series(self) -> list[str]:
+        return sorted({s for shows in self.abos.values() for s in shows})
+
+    def new_episodes(self, series_id: str, present: list[str]) -> list[str]:
+        """Episodes not announced yet; remembers them as announced."""
+        known = set(self.abo_known.get(series_id, []))
+        new = sorted(set(present) - known)
+        if new:
+            self.abo_known[series_id] = sorted(known | set(new))
+            self.save()
+        return new
 
     # --- weekly digest -----------------------------------------------------------
     def set_digest(self, key: str) -> None:

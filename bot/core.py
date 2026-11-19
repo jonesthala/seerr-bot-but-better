@@ -592,3 +592,39 @@ def request_done_text(kind: str, request_status: int, notify: bool = False) -> s
     if request_status == REQUEST_PENDING:
         return f"⏳ Angefragt! {what} wartet noch auf die Freigabe durch einen Admin.{then}"
     return f"✅ Angefragt! {what} wird jetzt gesucht und geladen.{then}"
+
+
+# --- /hilfe ---------------------------------------------------------------------
+# Who may use a command: everyone in the channel, those who may request (role), or admins only.
+EVERYONE, REQUESTERS, ADMINS = "everyone", "requesters", "admins"
+HELP = {  # command → (who, example)
+    "film": (REQUESTERS, "/film Sintel"),
+    "serie": (REQUESTERS, "/serie Pioneer One"),
+    "trending": (REQUESTERS, "/trending"),
+    "neu": (EVERYONE, "/neu"),
+    "status": (EVERYONE, "/status"),
+    "problem": (REQUESTERS, "/problem Sintel Ton «kein Ton ab Minute 20»"),
+    "jellyfin-zugang": (REQUESTERS, "/jellyfin-zugang"),
+    "abo": (REQUESTERS, "/abo South Park"),
+    "hilfe": (EVERYONE, "/hilfe"),
+    "löschen": (ADMINS, "/löschen Sintel"),
+    "jellyfin-liste": (ADMINS, "/jellyfin-liste"),
+    "jellyfin-entziehen": (ADMINS, "/jellyfin-entziehen @person"),
+    "speicher": (ADMINS, "/speicher"),
+}
+
+
+def help_text(commands: list[tuple[str, str]], admin: bool, may_request: bool) -> str:
+    """The commands this person may use, from (name, description) of the registered commands."""
+    allowed = {EVERYONE} | ({REQUESTERS} if may_request or admin else set()) | ({ADMINS} if admin else set())
+    mine, admins = [], []
+    for name, description in commands:
+        who, example = HELP.get(name, (EVERYONE, f"/{name}"))
+        if who not in allowed:
+            continue
+        line = f"`{example}`: {description}"
+        (admins if who == ADMINS else mine).append(line)
+    text = "\n".join(mine) or "Für dich gibt es hier keine Befehle."
+    if admins:
+        text += "\n\n**Nur für Admins**\n" + "\n".join(admins)
+    return text

@@ -36,6 +36,7 @@ from .core import (
     done_text,
     failed_text,
     format_numbers,
+    help_text,
     limit_text,
     new_line,
     next_allowed,
@@ -48,6 +49,7 @@ from .jellyfin import (
     JellyfinClient,
     JellyfinError,
     check_name,
+    new_episodes_text,
     suggest_name,
     usage_line,
     welcome_text,
@@ -61,6 +63,8 @@ PICK_TIMEOUT = 300  # seconds a search result stays clickable
 SPACE_CHECK_MINUTES = 30
 WATCH_MINUTES = 2  # new requests to approve, finished downloads to announce
 DIGEST_CHECK_MINUTES = 10
+ABO_MINUTES = 10  # how often subscribed shows are checked for new episodes
+SERIES_CACHE_SECONDS = 600  # the list of shows for /abo suggestions
 AUTOCOMPLETE_SECONDS = 2.5  # Discord gives up after 3 s
 MAX_CHECKS_PER_RUN = 30
 NO_ROLE = "🔒 Anfragen dürfen nur Leute mit der Rolle für Film- und Serienwünsche."
@@ -170,6 +174,7 @@ class SeerrBot(discord.Client):
         self._approval_lock = asyncio.Lock()
         self._friend_lock = asyncio.Lock()
         self.login_clicks: dict[int, float] = {}  # Discord user → when the last password was made
+        self._series: tuple[float, list[tuple[str, str]]] = (0.0, [])  # (when loaded, shows) for /abo
         self._background: set[asyncio.Task] = set()
 
     async def setup_hook(self) -> None:
@@ -183,6 +188,8 @@ class SeerrBot(discord.Client):
         self.watch_loop.start()
         if self.settings.weekly_digest:
             self.digest_loop.start()
+        if self.jellyfin is not None:
+            self.abo_loop.start()
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s", self.user)
@@ -286,11 +293,47 @@ class SeerrBot(discord.Client):
         except Exception:  # noqa: BLE001 - the loop must keep running
             log.exception("Weekly digest failed")
 
+    @tasks.loop(minutes=ABO_MINUTES)
+    async def abo_loop(self) -> None:
+        try:
+            await self.check_abos()
+        except Exception:  # noqa: BLE001 - the loop must keep running
+            log.exception("Abo check failed")
+
     @space_loop.before_loop
     @watch_loop.before_loop
     @digest_loop.before_loop
+    @abo_loop.before_loop
     async def _wait_until_ready(self) -> None:
         await self.wait_until_ready()
+
+    async def series_list(self) -> list[tuple[str, str]]:
+        """The shows in Jellyfin, (id, 'Name (Jahr)'), reloaded every few minutes."""
+        loaded, shows = self._series
+        if self.jellyfin is not None and (not shows or time.monotonic() - loaded > SERIES_CACHE_SECONDS):
+            shows = await asyncio.to_thread(self.jellyfin.series_list)
+            self._series = (time.monotonic(), shows)
+        return shows
+
+    async def check_abos(self) -> None:
+        """Tells subscribers about episodes that came into Jellyfin since the last check."""
+        if self.jellyfin is None:
+            return
+        for series_id in self.store.subscribed_series():
+            try:
+                present = await asyncio.to_thread(self.jellyfin.episodes, series_id)
+            except JellyfinError as error:
+                if error.status is None:
+                    return  # Jellyfin is down; try again next time
+                log.warning("Abo: could not read the episodes of %s: %s", series_id, error)
+                continue
+            new = self.store.new_episodes(series_id, list(present))
+            if not new:
+                continue
+            name = escape(self.store.abo_names.get(series_id, "einer Serie"))
+            text = new_episodes_text(name, {key: escape(present[key]) for key in new})
+            for user_id in self.store.subscribers(series_id):
+                await self.tell(user_id, text)
 
     async def sync_approvals(self) -> None:
         """Posts Approve/Decline buttons for new pending requests (also those made in Seerr itself)
@@ -1010,10 +1053,19 @@ def build_commands(bot: SeerrBot) -> list[app_commands.Command]:
         view = DeletePicker(bot, interaction.user, titles)
         view.message = await interaction.followup.send(embed=view.embed(view.current), view=view, wait=True)
 
+    @app_commands.command(name="hilfe", description="Welche Befehle es gibt und wie man sie benutzt")
+    async def hilfe(interaction: discord.Interaction) -> None:
+        registered = [(c.name, c.description)
+                      for c in bot.tree.get_commands(guild=discord.Object(id=bot.settings.guild_id))]
+        text = help_text(registered, bot.is_admin(interaction), bot.may_request(interaction))
+        embed = discord.Embed(title="❓ Was der Bot kann", description=text[:4000], color=discord.Color.blurple())
+        embed.set_footer(text="Die Befehle gehen nur in diesem Kanal. Antworten mit 🔒 sieht nur, wer gefragt hat.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
     commands = [film, serie, trending, neu, status, problem, loeschen]
     if bot.jellyfin is not None:
         commands += friend_commands(bot, requester)
-    return commands
+    return commands + [hilfe]
 
 
 def friend_commands(bot: SeerrBot, requester) -> list[app_commands.Command]:
@@ -1098,4 +1150,43 @@ def friend_commands(bot: SeerrBot, requester) -> list[app_commands.Command]:
         embed.set_footer(text="Löschen mit /löschen. Platz wird erst frei, wenn auch der Torrent weg ist.")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    return [jellyfin_zugang, jellyfin_entziehen, jellyfin_liste, speicher]
+    async def suggest_series(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        try:
+            shows = await asyncio.wait_for(bot.series_list(), AUTOCOMPLETE_SECONDS)
+        except Exception:  # noqa: BLE001 - no suggestions is fine, typing still works
+            return []
+        text, mine = current.strip().casefold(), set(bot.store.user_abos(interaction.user.id))
+        return [app_commands.Choice(name=shorten(("🔔 " if sid in mine else "") + label, 100), value=sid)
+                for sid, label in shows if text in label.casefold()][:25]
+
+    @app_commands.command(name="abo", description="Serie abonnieren: Du bekommst eine Nachricht, sobald neue Folgen da sind")
+    @app_commands.describe(serie="Serie aus der Bibliothek. Nochmals wählen beendet das Abo. Leer lassen: deine Abos")
+    @app_commands.autocomplete(serie=suggest_series)
+    @app_commands.check(requester)
+    async def abo(interaction: discord.Interaction, serie: Optional[str] = None) -> None:
+        user_id = interaction.user.id
+        if serie is None:
+            names = [f"**{escape(bot.store.abo_names.get(s, s))}**" for s in bot.store.user_abos(user_id)]
+            text = ("🔔 Deine Abos: " + ", ".join(names) + ". Nochmals `/abo <serie>` beendet eines.") if names else \
+                "🔕 Du hast keine Abos. Mit `/abo <serie>` bekommst du eine Nachricht, sobald neue Folgen da sind."
+            await interaction.response.send_message(text, ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        shows = dict(await bot.series_list())
+        wanted = serie.strip().casefold()
+        series_id = serie if serie in shows else next(
+            (sid for sid, label in shows.items() if label.casefold().startswith(wanted)), None)
+        if series_id is None:
+            await interaction.followup.send(f"🔎 Diese Serie ist nicht in der Bibliothek: **{escape(serie.strip())}**. "
+                                            "Mit `/serie` kannst du sie anfragen.", ephemeral=True)
+            return
+        present = await asyncio.to_thread(bot.jellyfin.episodes, series_id)
+        name = shows[series_id]
+        if bot.store.toggle_abo(user_id, series_id, name, list(present)):
+            text = (f"🔔 Abo für **{escape(name)}**: Ich schicke dir eine Nachricht, sobald neue Folgen da sind "
+                    f"(jetzt {len(present)} Folgen). Nochmals `/abo` mit dieser Serie beendet es.")
+        else:
+            text = f"🔕 Abo für **{escape(name)}** beendet."
+        await interaction.followup.send(text, ephemeral=True)
+
+    return [jellyfin_zugang, jellyfin_entziehen, jellyfin_liste, speicher, abo]
