@@ -401,7 +401,13 @@ class SeerrBot(discord.Client):
         if self.jellyfin is None:
             return
         await self.resolve_pending_abos()
+        try:
+            known = {sid for sid, _, _ in await self.series_list()}
+        except JellyfinError:
+            return  # Jellyfin is down; try again next time
         for series_id in self.store.subscribed_series():
+            if known and series_id not in known:
+                continue  # not in Jellyfin (any more), e.g. deleted: the abo waits in case it comes back
             try:
                 present = await asyncio.to_thread(self.jellyfin.episodes, series_id)
             except JellyfinError as error:
