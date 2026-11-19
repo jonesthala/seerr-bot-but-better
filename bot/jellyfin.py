@@ -262,6 +262,10 @@ class JellyfinClient:
         found = data.get("Items") if isinstance(data, dict) else None
         return {str(i["Id"]): i.get("UserData") or {} for i in found or [] if isinstance(i, dict) and i.get("Id")}
 
+    def refresh_library(self) -> None:
+        """Makes Jellyfin read the libraries again (after deleting, so deleted titles disappear)."""
+        self._call("POST", "/Library/Refresh", body={})
+
     def folder_name(self, kind: str, tmdb_id: int) -> str | None:
         """The folder of a movie or show in the library, e.g. 'Call Me by Your Name (2017)' (for /löschen)."""
         data = self._call("GET", "/Items", {"Recursive": "true", "Fields": "ProviderIds,Path",

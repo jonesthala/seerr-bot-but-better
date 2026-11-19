@@ -270,6 +270,10 @@ class SeerrClient:
         issue_id = data.get("id") if isinstance(data, dict) else None
         return issue_id if isinstance(issue_id, int) else None
 
+    def sync_availability(self) -> None:
+        """Starts Seerr's job that compares its library with Jellyfin and Sonarr/Radarr (marks deleted titles)."""
+        self._call("POST", "/settings/jobs/availability-sync/run", body={})
+
     def delete(self, title: Title) -> None:
         """Removes a movie or show (all seasons) from Radarr/Sonarr with its files, then resets it in Seerr."""
         if not title.in_library or title.media_id is None:

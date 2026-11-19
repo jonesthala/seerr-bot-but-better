@@ -76,7 +76,8 @@ to Radarr or Sonarr as usual.
 - **`/löschen <titel>`** (admins only): pick a movie or show from the library and delete it, files
   included, after a second confirmation click. It is reset in Seerr, so it can be requested again later.
   With qBittorrent access (setup step 5) it also removes the title's torrents with their files, so the space
-  is really freed, and says how much.
+  is really freed, and says how much. Afterwards Jellyfin reads its library again and, three minutes after the last
+  deletion, Seerr compares itself with it, so the title doesn't stay "available" in Seerr and `/neu`.
 - **Only where it belongs.** The bot answers in one channel; optionally only members with a role may request.
 - **Your search, your buttons.** Only the person who searched can pick and request.
 

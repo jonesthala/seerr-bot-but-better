@@ -105,6 +105,7 @@ MAX_CHECKS_PER_RUN = 30
 BRAKE_MINUTES = 1  # the download brake looks this often at the free space
 LIBRARY_CACHE_SECONDS = 600  # movies, shows and genres for /zufall and /filmabend
 WATCHED_MINUTES = 5  # how often Jellyfin is asked what was watched
+RESYNC_SECONDS = 180  # after deleting: Seerr compares itself with Jellyfin this long after the last deletion
 NO_ROLE = "🔒 Anfragen dürfen nur Leute mit der Rolle für Film- und Serienwünsche."
 NO_ADMIN = "🔒 Löschen dürfen nur Admins."
 NO_DELETING = "🔒 Löschen ist nicht eingerichtet: Es fehlen `DISCORD_ADMIN_USER_IDS` oder `DISCORD_ADMIN_ROLE_ID`."
@@ -215,6 +216,7 @@ class SeerrBot(discord.Client):
         self.profiles: dict[str, list[tuple[int, str]]] = {"movie": [], "tv": []}
         self._approval_lock = asyncio.Lock()
         self._watch_lock = asyncio.Lock()
+        self._resync: asyncio.Task | None = None  # Seerr sync waiting after a deletion
         self._friend_lock = asyncio.Lock()
         self.login_clicks: dict[int, float] = {}  # Discord user → when the last password was made
         self._series: tuple[float, list[tuple[str, str, int | None]]] = (0.0, [])  # (when loaded, shows) for /abo
@@ -519,6 +521,7 @@ class SeerrBot(discord.Client):
             # nothing is deleted, so it never ends up half done.
             torrents = await asyncio.to_thread(self.torrents.prepare, title.kind, title.tmdb_id)
         await asyncio.to_thread(self.seerr.delete, title)
+        self.schedule_seerr_sync()
         removed, problem = None, None
         if self.torrents is not None:
             try:
@@ -526,6 +529,26 @@ class SeerrBot(discord.Client):
             except TorrentError as error:
                 problem = str(error)
         return True, deleted_text(title, removed, problem)
+
+    def schedule_seerr_sync(self) -> None:
+        """After deleting: Seerr re-adds a title as long as Jellyfin still lists it (its scan runs every minute), so
+        Jellyfin reads the library again now, and Seerr compares itself with it a few minutes after the last deletion.
+        Without this the title stays "vorhanden" in Seerr and /neu until Seerr's nightly job."""
+        if self._resync is not None and not self._resync.done():
+            self._resync.cancel()  # wait from the last deletion on
+        self._resync = asyncio.create_task(self._seerr_sync_later())
+
+    async def _seerr_sync_later(self) -> None:
+        try:
+            if self.jellyfin is not None:
+                await asyncio.to_thread(self.jellyfin.refresh_library)
+            await asyncio.sleep(RESYNC_SECONDS)
+            await asyncio.to_thread(self.seerr.sync_availability)
+            log.info("Seerr availability sync started after deleting")
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - Seerr's nightly job catches up
+            log.exception("Seerr sync after deleting failed")
 
     async def delete_watched(self, question: WatchQuestion) -> str:
         """'Löschen' under a 'Geschaut' question: the movie as with /löschen, or just the watched episodes."""
@@ -549,6 +572,7 @@ class SeerrBot(discord.Client):
         hashes = await asyncio.to_thread(sonarr.episode_hashes, show["id"], [e["id"] for e in with_file])
         busy = await asyncio.to_thread(sonarr.queue_hashes)
         freed = await asyncio.to_thread(sonarr.drop_episodes, with_file)
+        self.schedule_seerr_sync()
         removed, problem = None, None
         if self.torrents is not None:
             try:

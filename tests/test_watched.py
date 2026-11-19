@@ -142,6 +142,11 @@ class JellyfinPlayedTest(unittest.TestCase):
         self.assertEqual(jellyfin.user_data("u1", ["e1", "dex"]), {"e1": {"Played": True}})
         self.assertEqual(jellyfin.user_data("u1", []), {})
 
+    def test_refresh_library(self):
+        calls = []
+        JellyfinClient("http://jf", "k", fetch=lambda m, u, h, b: calls.append((m, u)) or (204, None)).refresh_library()
+        self.assertEqual(calls, [("POST", "http://jf/Library/Refresh")])
+
 
 class SettingTest(unittest.TestCase):
     BASE = {"DISCORD_TOKEN": "x", "DISCORD_GUILD_ID": "1", "DISCORD_CHANNEL_ID": "2", "SEERR_API_KEY": "k"}

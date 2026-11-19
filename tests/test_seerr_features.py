@@ -88,6 +88,11 @@ class DiscoverTest(unittest.TestCase):
         self.assertEqual(seerr.name_of("movie", 45745), "Sintel (2010)")
         self.assertEqual(len(fake.calls), 1)  # no extra lookup
 
+    def test_sync_availability(self):
+        fake = FakeSeerr({("POST", "/settings/jobs/availability-sync/run"): (200, {})})
+        client(fake).sync_availability()
+        self.assertEqual(fake.calls[0]["method"], "POST")
+
     def test_recently_added(self):
         data = {"results": [{"mediaType": "movie", "tmdbId": 45745, "mediaAddedAt": "2026-11-17T13:28:19Z"}]}
         fake = FakeSeerr({("GET", "/media"): (200, data)})
