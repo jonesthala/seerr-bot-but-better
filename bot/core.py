@@ -57,6 +57,7 @@ class Title:
     status: int
     seasons: tuple[Season, ...] = ()
     media_id: int | None = None  # Seerr's own id, exists once something was requested or found
+    runtime: int | None = None  # minutes: the movie, or one episode of a show; only in details answers
 
     @property
     def in_library(self) -> bool:
@@ -186,7 +187,16 @@ def title_from(item: Any, kind: str | None = None) -> Title | None:
         status=_media_status(item),
         seasons=_seasons(item) if kind == "tv" else (),
         media_id=info.get("id") if isinstance(info.get("id"), int) else None,
+        runtime=_runtime(item, kind),
     )
+
+
+def _runtime(item: dict, kind: str) -> int | None:
+    if kind == "movie":
+        value = item.get("runtime")
+        return value if isinstance(value, int) and value > 0 else None
+    values = [v for v in item.get("episodeRunTime") or [] if isinstance(v, int) and v > 0]
+    return sorted(values)[len(values) // 2] if values else None
 
 
 def search_results(data: Any, kind: str | None, library_only: bool = False) -> list[Title]:
@@ -628,3 +638,57 @@ def help_text(commands: list[tuple[str, str]], admin: bool, may_request: bool) -
     if admins:
         text += "\n\n**Nur für Admins**\n" + "\n".join(admins)
     return text
+
+
+# --- size estimate before requesting ----------------------------------------------------------
+EPISODE_MINUTES_GUESS = 45  # when TMDB knows no episode length
+
+
+@dataclass(frozen=True)
+class SizeRate:
+    """GB per hour of running time: typical value and a range, measured in the own library."""
+    typical: float
+    low: float
+    high: float
+    titles: int = 0  # how many titles of the library it is based on; 0 = rule of thumb
+
+
+RULE_OF_THUMB = SizeRate(1.8, 0.9, 3.5)
+
+
+def rate_from_library(rates: list[float]) -> SizeRate:
+    """From the GB per hour of each movie/show in the library; the rule of thumb below three titles."""
+    rates = sorted(r for r in rates if r > 0)
+    if len(rates) < 3:
+        return RULE_OF_THUMB
+    typical = rates[len(rates) // 2] if len(rates) % 2 else (rates[len(rates) // 2 - 1] + rates[len(rates) // 2]) / 2
+    return SizeRate(typical, min(rates[0], 0.6 * typical), max(rates[-1], 1.6 * typical), len(rates))
+
+
+def space_text(title: Title, seasons: list[int] | None, rate: SizeRate, free: int | None, min_free: int) -> str | None:
+    """'≈ 18 GB (9–29 GB) …' for the request window; None if there is nothing to estimate."""
+    if title.kind == "movie":
+        if not title.runtime:
+            return None
+        hours, what, guessed = title.runtime / 60, f"{title.runtime} Min.", False
+    else:
+        wanted = set(seasons or [])
+        episodes = sum(s.episodes for s in title.seasons if s.number in wanted)
+        if not episodes:
+            return None
+        minutes = title.runtime or EPISODE_MINUTES_GUESS
+        hours, guessed = episodes * minutes / 60, title.runtime is None
+        what = f"{episodes} Folgen à {minutes} Min." + (" (Länge unbekannt, geschätzt)" if guessed else "")
+    typical, low, high = (int(hours * r * GB) for r in (rate.typical, rate.low, rate.high))
+    text = f"≈ **{size_text(typical)}** ({size_text(low)}–{size_text(high)}) für {what}"
+    if free is not None:
+        text += f"\nFrei: {size_text(free)}"
+        if free - typical < min_free <= free - low:
+            text += (f"\n⚠️ Könnte knapp werden: Danach wären etwa {size_text(max(free - typical, 0))} frei, "
+                     f"unter {size_text(min_free)} nehme ich keine Anfragen mehr an.")
+        elif free - low < min_free:
+            text += ("\n❌ Reicht vermutlich nicht. Erst Platz schaffen, zum Beispiel mit `/löschen`, oder weniger "
+                     "Staffeln wählen.")
+    basis = (f"Schätzung aus deiner Bibliothek ({rate.typical:.1f} GB pro Stunde)" if rate.titles
+             else "Faustregel, die Bibliothek ist noch zu klein für eine eigene Schätzung")
+    return text + f"\n-# {basis}. Die echte Grösse hängt vom gefundenen Release ab."

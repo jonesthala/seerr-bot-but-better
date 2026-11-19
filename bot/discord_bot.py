@@ -35,9 +35,13 @@ from .core import (
     digest_key,
     done_text,
     failed_text,
+    RULE_OF_THUMB,
+    SizeRate,
     format_numbers,
     help_text,
     limit_text,
+    rate_from_library,
+    space_text,
     new_line,
     next_allowed,
     request_done_text,
@@ -65,6 +69,7 @@ WATCH_MINUTES = 2  # new requests to approve, finished downloads to announce
 DIGEST_CHECK_MINUTES = 10
 ABO_MINUTES = 10  # how often subscribed shows are checked for new episodes
 SERIES_CACHE_SECONDS = 600  # the list of shows for /abo suggestions
+RATE_CACHE_SECONDS = 3600  # GB per hour measured in the library, for the size estimate
 AUTOCOMPLETE_SECONDS = 2.5  # Discord gives up after 3 s
 MAX_CHECKS_PER_RUN = 30
 NO_ROLE = "🔒 Anfragen dürfen nur Leute mit der Rolle für Film- und Serienwünsche."
@@ -175,6 +180,7 @@ class SeerrBot(discord.Client):
         self._friend_lock = asyncio.Lock()
         self.login_clicks: dict[int, float] = {}  # Discord user → when the last password was made
         self._series: tuple[float, list[tuple[str, str]]] = (0.0, [])  # (when loaded, shows) for /abo
+        self._rate: tuple[float, SizeRate] = (0.0, RULE_OF_THUMB)  # (when measured, GB per hour)
         self._background: set[asyncio.Task] = set()
 
     async def setup_hook(self) -> None:
@@ -314,6 +320,17 @@ class SeerrBot(discord.Client):
             shows = await asyncio.to_thread(self.jellyfin.series_list)
             self._series = (time.monotonic(), shows)
         return shows
+
+    async def size_rate(self) -> SizeRate:
+        """GB per hour of the own library, measured at most once an hour; the rule of thumb without Jellyfin."""
+        measured, rate = self._rate
+        if self.jellyfin is not None and (not measured or time.monotonic() - measured > RATE_CACHE_SECONDS):
+            try:
+                rate = rate_from_library(await asyncio.to_thread(self.jellyfin.size_rates))
+                self._rate = (time.monotonic(), rate)
+            except Exception:  # noqa: BLE001 - the estimate is a nice-to-have, keep the last value
+                log.warning("Could not measure the library for the size estimate")
+        return rate
 
     async def check_abos(self) -> None:
         """Tells subscribers about episodes that came into Jellyfin since the last check."""
@@ -725,7 +742,8 @@ class SeasonSelect(discord.ui.Select):
             option.default = option.value in self.values
         self.picker.seasons = sorted(int(value) for value in self.values)
         self.picker.update_button()
-        await interaction.response.edit_message(view=self.picker)
+        # the size estimate depends on the seasons
+        await interaction.response.edit_message(embed=self.picker.embed(self.picker.current), view=self.picker)
 
 
 class ProfileSelect(discord.ui.Select):
@@ -781,9 +799,17 @@ class RequestButton(discord.ui.Button):
             bot.in_background(bot.sync_approvals())
 
 
+def needs_details(title: Title) -> bool:
+    """Search results lack the seasons of a show and every running time: ask Seerr for the details."""
+    return title.runtime is None or (title.kind == "tv" and not title.seasons)
+
+
 class RequestPicker(Picker):
-    def __init__(self, bot: SeerrBot, owner: discord.abc.User, titles: list[Title]) -> None:
+    def __init__(self, bot: SeerrBot, owner: discord.abc.User, titles: list[Title],
+                 rate: SizeRate = RULE_OF_THUMB, free: int | None = None) -> None:
         super().__init__(bot, owner, titles)
+        self.rate = rate  # for the size estimate
+        self.free = free
         self.seasons: list[int] | None = None
         self.season_select: SeasonSelect | None = None
         self.profile_id: int | None = None
@@ -795,10 +821,18 @@ class RequestPicker(Picker):
 
     async def choose(self, index: int) -> Title:
         title = self.titles[index]
-        if title.kind == "tv" and not title.seasons:
-            title = await asyncio.to_thread(self.bot.seerr.details, "tv", title.tmdb_id)
+        if needs_details(title):
+            title = await asyncio.to_thread(self.bot.seerr.details, title.kind, title.tmdb_id)
             self.titles[index] = title
         return title
+
+    def embed(self, title: Title, footer: str | None = None) -> discord.Embed:
+        embed = super().embed(title, footer)
+        if title.requestable:
+            text = space_text(title, self.seasons, self.rate, self.free, self.bot.settings.min_free_gb * GB)
+            if text:
+                embed.add_field(name="💾 Platz", value=text[:1024], inline=False)
+        return embed
 
     def show(self, title: Title) -> None:
         super().show(title)
@@ -932,9 +966,14 @@ def build_commands(bot: SeerrBot) -> list[app_commands.Command]:
         return await asyncio.to_thread(bot.seerr.search, query, kind, library_only)
 
     async def show_picker(interaction: discord.Interaction, titles: list[Title], hint: str | None) -> None:
-        if titles[0].kind == "tv" and not titles[0].seasons:
-            titles[0] = await asyncio.to_thread(bot.seerr.details, "tv", titles[0].tmdb_id)
-        view = RequestPicker(bot, interaction.user, titles)
+        if needs_details(titles[0]):
+            titles[0] = await asyncio.to_thread(bot.seerr.details, titles[0].kind, titles[0].tmdb_id)
+        rate = await bot.size_rate()
+        try:
+            free = await asyncio.to_thread(bot.seerr.free_bytes)
+        except Exception:  # noqa: BLE001 - only for the estimate
+            free = None
+        view = RequestPicker(bot, interaction.user, titles, rate, free)
         view.message = await interaction.followup.send(embed=view.embed(view.current, hint), view=view, wait=True)
 
     async def search_and_show(interaction: discord.Interaction, query: str, kind: str) -> None:

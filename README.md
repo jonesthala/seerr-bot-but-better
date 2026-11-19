@@ -29,6 +29,10 @@ to Radarr or Sonarr as usual.
 - **Quality or language** (optional): offer some of your Radarr/Sonarr quality profiles, e.g. 1080p and 4K,
   or a German and an original-language profile.
 - **`/trending`**: what is popular right now, ready to request.
+- **Size estimate before requesting**: the request window shows roughly how many GB the chosen movie or
+  seasons will take (running time from TMDB × GB per hour), the free space, and a warning if it gets tight.
+  With the Jellyfin setup below, GB per hour is measured in your own library (hourly); otherwise a rule of
+  thumb (1.8 GB per hour). It updates when you change the seasons.
 - **Limit per person** (optional), e.g. 3 requests per week. Admins have no limit.
 
 **Following up**

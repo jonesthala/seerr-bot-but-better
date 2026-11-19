@@ -36,6 +36,11 @@ class Usage:
     tmdb_id: int | None
     last_played: datetime | None  # None: nobody started it yet
     viewers: int  # how many Jellyfin users watched (part of) it
+    hours: float = 0.0  # running time of all its files
+
+    @property
+    def gb_per_hour(self) -> float | None:
+        return self.size / 1024 ** 3 / self.hours if self.hours >= 0.25 and self.size else None
 
 
 def _tmdb(item: dict) -> int | None:
@@ -61,10 +66,13 @@ def library_usage(items: list[dict], series: list[dict], watched: dict[str, list
         key = item["SeriesId"] if episode else item["Id"]
         source = shows.get(key, {"Name": item.get("SeriesName"), "Id": key}) if episode else item
         group = groups.setdefault(key, {"name": _label(source), "kind": "tv" if episode else "movie",
-                                        "tmdb": _tmdb(source), "size": 0, "files": 0, "last": None, "viewers": set()})
+                                        "tmdb": _tmdb(source), "size": 0, "files": 0, "last": None, "viewers": set(),
+                                        "hours": 0.0})
         sources = [m for m in item.get("MediaSources") or [] if isinstance(m, dict)]
         group["size"] += sum(m.get("Size") or 0 for m in sources if isinstance(m.get("Size"), int))
         group["files"] += 1
+        ticks = item.get("RunTimeTicks")
+        group["hours"] += ticks / 1e7 / 3600 if isinstance(ticks, int) and ticks > 0 else 0.0
         owner[item["Id"]] = key
     for user_id, seen in watched.items():
         for item in seen:
@@ -78,7 +86,7 @@ def library_usage(items: list[dict], series: list[dict], watched: dict[str, list
             moment = parse_time(data.get("LastPlayedDate"))
             if moment and (group["last"] is None or moment > group["last"]):
                 group["last"] = moment
-    found = [Usage(g["name"], g["kind"], g["size"], g["files"], g["tmdb"], g["last"], len(g["viewers"]))
+    found = [Usage(g["name"], g["kind"], g["size"], g["files"], g["tmdb"], g["last"], len(g["viewers"]), g["hours"])
              for g in groups.values()]
     return sorted(found, key=lambda u: u.size, reverse=True)
 
@@ -187,6 +195,14 @@ class JellyfinClient:
         watched = {str(u.get("Id")): items(userId=str(u.get("Id")), IncludeItemTypes="Movie,Episode", Fields="UserData")
                    for u in self.users() if u.get("Id")}
         return library_usage(files, series, watched)
+
+    def size_rates(self) -> list[float]:
+        """GB per hour of running time of each movie/show in the library (for the size estimate)."""
+        data = self._call("GET", "/Items", {"Recursive": "true", "IncludeItemTypes": "Movie,Episode",
+                                           "Fields": "MediaSources"})
+        found = data.get("Items") if isinstance(data, dict) else None
+        files = [i for i in found or [] if isinstance(i, dict)]
+        return [rate for u in library_usage(files, [], {}) if (rate := u.gb_per_hour) is not None]
 
     def series_list(self) -> list[tuple[str, str]]:
         """(Jellyfin id, 'Name (Jahr)') of every show in the library, by name (for /abo)."""
