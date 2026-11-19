@@ -144,6 +144,10 @@ class ArrClient:
         found = self._get("/series")
         return [s["id"] for s in found or [] if isinstance(s, dict) and s.get("tmdbId") == tmdb_id]
 
+    def manages(self, tmdb_id: int) -> bool:
+        """Whether Sonarr/Radarr know the title. Files that were in the library before them aren't theirs to delete."""
+        return bool(self._ids(tmdb_id))
+
     def download_ids(self, tmdb_id: int) -> list[str]:
         """Torrent hashes of everything ever downloaded for this title (lower case, without duplicates)."""
         path, key = ("/history/movie", "movieId") if self.kind == "movie" else ("/history/series", "seriesId")

@@ -207,8 +207,8 @@ class SeerrClient:
         return titles
 
     def recently_added(self, limit: int = 10) -> list[NewMedia]:
-        """What came into the library last, newest first."""
-        data = self._call("GET", "/media", {"take": limit, "skip": 0, "filter": "available", "sort": "mediaAdded"})
+        """What came into the library last, newest first; shows that are only partly there too."""
+        data = self._call("GET", "/media", {"take": limit, "skip": 0, "filter": "allavailable", "sort": "mediaAdded"})
         return new_media(data)
 
     def profiles(self, kind: str, names: list[str]) -> list[tuple[int, str]]:

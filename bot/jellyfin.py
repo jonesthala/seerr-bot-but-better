@@ -12,6 +12,7 @@ import secrets
 import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import PurePosixPath
 from typing import Any
 
 from .core import format_numbers, parse_time
@@ -221,6 +222,17 @@ class JellyfinClient:
             if key:
                 keys[key] = str(item.get("Name") or "")
         return keys
+
+    def folder_name(self, kind: str, tmdb_id: int) -> str | None:
+        """The folder of a movie or show in the library, e.g. 'Call Me by Your Name (2017)' (for /löschen)."""
+        data = self._call("GET", "/Items", {"Recursive": "true", "Fields": "ProviderIds,Path",
+                                           "IncludeItemTypes": "Movie" if kind == "movie" else "Series"})
+        found = data.get("Items") if isinstance(data, dict) else None
+        for item in found or []:
+            if isinstance(item, dict) and _tmdb(item) == tmdb_id and isinstance(item.get("Path"), str):
+                path = PurePosixPath(item["Path"])
+                return (path.parent if kind == "movie" else path).name or None
+        return None
 
     def folder_ids(self) -> list[str]:
         """Ids of the libraries friends may see (JELLYFIN_FRIEND_LIBRARIES); all if none are named."""

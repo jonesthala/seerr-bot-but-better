@@ -147,6 +147,20 @@ class DigestTest(unittest.TestCase):
         self.assertEqual(new_line(items[0], "Sintel [2010]", timezone.utc), "🎬 [Sintel (2010)](http://jf/1) · 17.11.")
         self.assertEqual(new_line(items[1], "Loki", timezone.utc), "📺 **Loki** · 01.11.")
 
+    def test_partly_there(self):
+        seasons = [{"seasonNumber": n, "status": 1} for n in range(1, 23)] + [{"seasonNumber": 23, "status": 4}]
+        data = {"results": [
+            {"mediaType": "tv", "tmdbId": 37854, "status": 4, "mediaAddedAt": "2026-11-19T10:22:00Z", "seasons": seasons},
+            {"mediaType": "tv", "tmdbId": 2190, "status": 4, "mediaAddedAt": "2026-11-17T10:00:00Z",
+             "seasons": [{"seasonNumber": n, "status": 5} for n in range(0, 6)]},
+            {"mediaType": "movie", "tmdbId": 1, "status": 5, "mediaAddedAt": "2026-11-17T10:00:00Z"}]}
+        show, many, movie = new_media(data)
+        self.assertEqual(show.partial, (23,))
+        self.assertEqual(new_line(show, "One Piece (1999)", timezone.utc),
+                         "📺 **One Piece (1999)** · 19.11. · teilweise da (Staffel 23)")
+        self.assertEqual(new_line(many, "South Park", timezone.utc), "📺 **South Park** · 17.11. · teilweise da (5 Staffeln)")
+        self.assertIsNone(movie.partial)
+
 
 class TrendingAndProfilesTest(unittest.TestCase):
     def test_trending(self):

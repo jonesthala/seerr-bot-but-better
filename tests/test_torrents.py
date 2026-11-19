@@ -4,7 +4,7 @@ from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from bot.config import Settings
-from bot.core import GB, Title, deleted_text
+from bot.core import GB, Title, deleted_text, unmanaged_text
 from bot.torrents import ArrClient, QbitClient, TorrentCleaner, TorrentError
 
 QBIT = "http://qbit.test:8080"
@@ -102,6 +102,11 @@ class TorrentTest(unittest.TestCase):
             cleaner(FakeQbit(), FakeArr(status=401)).prepare("tv", 31911)
         self.assertIn("Sonarr", str(caught.exception))
 
+    def test_manages(self):
+        sonarr = ArrClient("http://sonarr", "k", "tv", fetch=FakeArr())
+        self.assertTrue(sonarr.manages(31911))
+        self.assertFalse(sonarr.manages(398818))  # was in the library before Sonarr
+
     def test_relogin_after_expired_session(self):
         qbit = FakeQbit()
         client = QbitClient(QBIT, "admin", "richtig", fetch=qbit)
@@ -119,6 +124,13 @@ class TextTest(unittest.TestCase):
         self.assertIn("kein Torrent mehr", deleted_text(self.SHOW, (0, 0)))
         self.assertIn("noch in qBittorrent", deleted_text(self.SHOW, None, "qBittorrent ist nicht erreichbar."))
         self.assertIn("erst frei", deleted_text(self.SHOW))  # without qBittorrent access, as before
+
+    def test_unmanaged(self):
+        movie = Title("movie", 398818, "Call Me by Your Name", "2017", "", None, 5)
+        text = unmanaged_text(movie, "Radarr", "Call Me by Your Name (2017)")
+        self.assertTrue(text.startswith("⚠️ Nichts gelöscht: Radarr kennt den Film nicht"))
+        self.assertIn("den Ordner `Call Me by Your Name (2017)` von Hand", text)
+        self.assertIn("die Dateien von Hand", unmanaged_text(self.SHOW, "Sonarr", None))
 
 
 class SettingsTest(unittest.TestCase):

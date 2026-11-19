@@ -47,6 +47,7 @@ from .core import (
     request_done_text,
     shorten,
     size_text,
+    unmanaged_text,
 )
 from .jellyfin import (
     TAILSCALE_ADMIN,
@@ -1040,6 +1041,20 @@ class DeleteButton(discord.ui.Button):
             return
         await interaction.response.defer()
         bot, title = picker.bot, picker.current
+        arr = bot.arrs.get(title.kind)
+        if arr is not None and not await asyncio.to_thread(arr.manages, title.tmdb_id):
+            # The files were there before Sonarr/Radarr: Seerr would say "deleted" and leave them on the disk.
+            folder = None
+            if bot.jellyfin is not None:
+                try:
+                    folder = await asyncio.to_thread(bot.jellyfin.folder_name, title.kind, title.tmdb_id)
+                except JellyfinError:
+                    pass
+            picker.stop()
+            embed = title_embed(bot, title, footer=f"Nicht gelöscht · {interaction.user.display_name}")
+            embed.set_field_at(0, name="Status", value=unmanaged_text(title, arr.name, folder), inline=False)
+            await interaction.edit_original_response(embed=embed, view=None)
+            return
         torrents: list[dict] = []
         if bot.torrents is not None:
             # Before deleting: Sonarr/Radarr forget the downloads with the title. If that or qBittorrent fails,

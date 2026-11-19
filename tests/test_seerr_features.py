@@ -93,6 +93,7 @@ class DiscoverTest(unittest.TestCase):
         fake = FakeSeerr({("GET", "/media"): (200, data)})
         self.assertEqual([i.tmdb_id for i in client(fake).recently_added(5)], [45745])
         self.assertIn("sort=mediaAdded", fake.calls[0]["query"])
+        self.assertIn("filter=allavailable", fake.calls[0]["query"])  # partly available shows too
         self.assertIn("take=5", fake.calls[0]["query"])
 
     def test_profiles(self):

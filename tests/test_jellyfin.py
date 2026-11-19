@@ -178,6 +178,19 @@ class UsageTest(unittest.TestCase):
         self.assertEqual(usage_line(2, sintel, "0.6 GB", None, zone),
                          "2. **Sintel (2010)** · 0.6 GB · 1 Datei · 💤 noch nie geschaut")
 
+    def test_folder_name(self):
+        items = {"Items": [
+            {"Type": "Movie", "ProviderIds": {"Tmdb": "398818"},
+             "Path": "/media/movies/Call Me by Your Name (2017)/Call Me By Your Name (2017) [1080p].mp4"},
+            {"Type": "Series", "ProviderIds": {"Tmdb": "37854"}, "Path": "/media/shows/One Piece (1999)"},
+            {"Type": "Movie", "ProviderIds": {"Tmdb": "1"}}]}
+        fake = FakeJellyfin({("GET", "/Items"): (200, items)})
+        self.assertEqual(client(fake).folder_name("movie", 398818), "Call Me by Your Name (2017)")
+        self.assertEqual(client(fake).folder_name("tv", 37854), "One Piece (1999)")
+        self.assertIsNone(client(fake).folder_name("movie", 1))  # no path
+        self.assertIsNone(client(fake).folder_name("movie", 5))
+        self.assertIn("Fields=ProviderIds%2CPath", fake.calls[0]["query"])
+
     def test_client_asks_per_user(self):
         calls = []
 

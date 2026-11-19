@@ -507,6 +507,7 @@ class NewMedia:
     tmdb_id: int
     added: datetime | None
     url: str | None
+    partial: tuple[int, ...] | None = None  # shows only partly there: the seasons that are (partly) there
 
 
 def new_media(data: Any) -> list[NewMedia]:
@@ -518,11 +519,18 @@ def new_media(data: Any) -> list[NewMedia]:
                 or not isinstance(item.get("tmdbId"), int):
             continue
         url = item.get("mediaUrl")
+        partial = None
+        if item.get("status") == PARTIAL:
+            seasons = item.get("seasons") if isinstance(item.get("seasons"), list) else []
+            partial = tuple(sorted(s["seasonNumber"] for s in seasons if isinstance(s, dict)
+                                   and isinstance(s.get("seasonNumber"), int) and s["seasonNumber"] > 0
+                                   and s.get("status") in (PARTIAL, AVAILABLE)))
         items.append(NewMedia(
             kind=item["mediaType"],
             tmdb_id=item["tmdbId"],
             added=parse_time(item.get("mediaAddedAt")),
             url=url if isinstance(url, str) and url.startswith(("http://", "https://")) else None,
+            partial=partial,
         ))
     return items
 
@@ -532,7 +540,13 @@ def new_line(item: NewMedia, name: str, zone: tzinfo) -> str:
     safe = name.replace("[", "(").replace("]", ")")
     shown = f"[{safe}]({item.url})" if item.url else f"**{safe}**"
     date = f" · {item.added.astimezone(zone):%d.%m.}" if item.added else ""
-    return f"{icon} {shown}{date}"
+    part = ""
+    if item.partial is not None:
+        seasons = item.partial
+        which = (f" (Staffel {', '.join(map(str, seasons))})" if 0 < len(seasons) <= 3
+                 else f" ({len(seasons)} Staffeln)" if seasons else "")
+        part = f" · teilweise da{which}"
+    return f"{icon} {shown}{date}{part}"
 
 
 _WEEKDAYS = {
@@ -607,6 +621,16 @@ def deleted_text(title: Title, removed: tuple[int, int] | None = None, problem: 
     torrents = "1 Torrent" if count == 1 else f"{count} Torrents"
     return (f"🗑️ {what} ist gelöscht, mit allen Dateien und {torrents} in qBittorrent. "
             f"Frei geworden: etwa {size_text(size)}.")
+
+
+def unmanaged_text(title: Title, app: str, folder: str | None) -> str:
+    """/löschen for a title that Sonarr/Radarr don't know: its files were in the library before, so Seerr can't
+    have them deleted. Nothing is deleted, and the admin learns which folder to remove by hand."""
+    what = "den Film" if title.kind == "movie" else "die Serie"
+    where = f"den Ordner `{folder}`" if folder else "die Dateien"
+    return (f"⚠️ Nichts gelöscht: {app} kennt {what} nicht, die Dateien lagen schon vorher in der Bibliothek. "
+            f"Darum kann der Bot sie nicht löschen. Ein Admin muss {where} von Hand löschen, "
+            "danach verschwindet der Titel beim nächsten Scan aus Jellyfin.")
 
 
 def request_done_text(kind: str, request_status: int, notify: bool = False) -> str:
