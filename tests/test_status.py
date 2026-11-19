@@ -3,7 +3,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlsplit
 
-from bot.arr import ArrClient, Download, Progress, bar, download_line, downloads_from_queue, progress_lines, speed_text
+from bot.arr import (ArrClient, Download, Progress, bar, card, download_line, downloads_from_queue, emoji_bar,
+                     progress_lines, speed_text)
 from bot.store import Store
 
 NOW = datetime(2026, 11, 19, 12, 0, tzinfo=timezone.utc)
@@ -123,6 +124,28 @@ class LinesTest(unittest.TestCase):
         many = tuple(Download(f"S01E{n:02d}", 10, 5, None, "downloading", hash=str(n), episodes=1) for n in range(7))
         lines = progress_lines("tv", Progress(0, 7, {}, 0, many, False), {}, NOW)
         self.assertEqual(lines[-1], "… und 3 weitere Downloads")
+
+
+class CardTest(unittest.TestCase):
+    def test_one_piece_card(self):
+        downloads = tuple([Download(f"S23E{n:02d}", 1000, 600, NOW + timedelta(minutes=25), "downloading", hash=f"d{n}", episodes=1)
+                           for n in range(1, 13)]
+                          + [Download(f"S23E{n:02d}", 1000, 900, None, "paused", hash=f"p{n}", episodes=1) for n in range(13, 18)])
+        info = card("tv", Progress(0, 17, {23: [18, 19]}, 0, downloads, False), {"d1": {"dlspeed": 600_000}}, NOW)
+        self.assertEqual(info.headline.splitlines()[0], "🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜  **28 %**")  # 12 × 40 % of 17 episodes
+        self.assertEqual(info.headline.splitlines()[1], "0.0 von 0.0 GB · 600 KB/s · fertig noch ca. 25 Min.")
+        self.assertEqual(info.counts, "📦 **0** von 17 da · ⬇️ 12 laden · ⏸️ 5 pausiert")
+        self.assertEqual(len(info.active), 6)  # five bars and "… und 7 weitere"
+        self.assertTrue(info.active[0].startswith("`S23E01` 🟦🟦🟦⬜⬜⬜⬜⬜ **40 %**"))
+        self.assertEqual(info.other, ["⏸️ **Pausiert:** S23 Folge 13–17"])
+        self.assertIn("Staffel 23: Folge 18–19", info.missing)
+        self.assertEqual((info.color, info.speed), ("blue", 600_000))
+
+    def test_colors(self):
+        self.assertEqual(card("tv", Progress(5, 5, {}, 0, (), False), {}, NOW).color, "green")
+        paused = (Download("S01E01", 10, 10, None, "paused", episodes=1),)
+        self.assertEqual(card("tv", Progress(0, 1, {}, 0, paused, False), {}, NOW).color, "orange")
+        self.assertEqual(emoji_bar(100, 4, "🟩"), "🟩🟩🟩🟩")
 
 
 class AutoAboTest(unittest.TestCase):

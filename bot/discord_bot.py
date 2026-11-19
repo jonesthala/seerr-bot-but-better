@@ -59,7 +59,7 @@ from .jellyfin import (
     welcome_text,
 )
 from .seerr import SeerrClient
-from .arr import ArrClient, ArrError, Progress, progress_lines
+from .arr import ArrClient, ArrError, Progress, card, speed_text
 from .torrents import QbitClient, TorrentCleaner, TorrentError
 from .store import FRIEND_APPROVED, FRIEND_DECLINED, FRIEND_PENDING, FRIEND_REVOKED, Approval, Friend, Store
 
@@ -187,6 +187,7 @@ class SeerrBot(discord.Client):
         self.login_clicks: dict[int, float] = {}  # Discord user → when the last password was made
         self._series: tuple[float, list[tuple[str, str, int | None]]] = (0.0, [])  # (when loaded, shows) for /abo
         self.status_clicks: dict[int, float] = {}  # status message → last refresh
+        self._posters: dict[tuple[str, int], str | None] = {}  # for the /status cards
         self._rate: tuple[float, SizeRate] = (0.0, RULE_OF_THUMB)  # (when measured, GB per hour)
         self._background: set[asyncio.Task] = set()
 
@@ -389,8 +390,18 @@ class SeerrBot(discord.Client):
                 for user_id in self.store.take_pending_abos(tmdb_id):
                     self.store.subscribe(user_id, sid, label, [])  # everything there now is new for them
 
-    async def status_embed(self) -> discord.Embed:
-        """/status: per open request what Seerr knows, and with Sonarr/Radarr the episodes, downloads and searches."""
+    async def poster(self, kind: str, tmdb_id: int) -> str | None:
+        """The poster of a title for /status, remembered after the first time."""
+        key = (kind, tmdb_id)
+        if key not in self._posters:
+            try:
+                self._posters[key] = (await asyncio.to_thread(self.seerr.details, kind, tmdb_id)).poster
+            except SeerrError:
+                return None
+        return self._posters[key]
+
+    async def status_embeds(self) -> list[discord.Embed]:
+        """/status: a summary card, then one card per open request with bars, episodes and downloads."""
         items = await asyncio.to_thread(self.seerr.open_requests)
         free = await asyncio.to_thread(self.seerr.free_bytes)
         now = datetime.now(timezone.utc)
@@ -410,23 +421,55 @@ class SeerrBot(discord.Client):
             try:
                 live = {str(t.get("hash")).lower(): t for t in await asyncio.to_thread(self.qbit.torrents, hashes)}
             except ArrError:
-                pass  # without speed and sources
-        embed = discord.Embed(title="Status", color=discord.Color.blurple())
-        for item, name in items[:25]:
+                pass  # without speed
+        colors = {"blue": discord.Color.blue(), "orange": discord.Color.orange(), "green": discord.Color.green(),
+                  "gold": discord.Color.gold()}
+        cards, speed, active = [], 0, 0
+        for item, name in items[:STATUS_CARDS]:
             tracked = self.store.request(item.request_id)
             who = tracked.user_name if tracked else item.requested_by
+            embed = discord.Embed(title=shorten(name, 256), url=self.settings.page_url(item.kind, item.tmdb_id))
+            embed.set_author(name="📺 Serie" if item.kind == "tv" else "🎬 Film")
+            poster = await self.poster(item.kind, item.tmdb_id)
+            if poster:
+                embed.set_thumbnail(url=poster)
             progress = details.get((item.kind, item.tmdb_id))
-            lines = progress_lines(item.kind, progress, live, now) if progress else [item.state(now)]
-            embed.add_field(name=shorten(name + (f" · von {who}" if who else ""), 256),
-                            value="\n".join(lines)[:1024] or "–", inline=False)
-        head = [] if items else ["📭 Keine offenen Anfragen. Alles Angefragte ist schon da."]
+            if item.request_status == REQUEST_PENDING:
+                embed.description = "⏳ **Wartet auf Freigabe** durch einen Admin."
+                embed.color = discord.Color.light_grey()
+            elif progress is None:
+                embed.description = item.state(now)
+                embed.color = discord.Color.blurple()
+            else:
+                info = card(item.kind, progress, live, now)
+                speed += info.speed
+                active += sum(1 for d in progress.downloads if d.state == "downloading")
+                embed.description = info.headline
+                embed.color = colors[info.color]
+                for field, value in (("Folgen", info.counts), ("Lädt gerade", "\n".join(info.active)),
+                                     ("Pausiert / Probleme", "\n".join(info.other)), ("Fehlt noch", info.missing)):
+                    if value:
+                        embed.add_field(name=field, value=value[:1024], inline=False)
+            if who:
+                embed.set_footer(text=f"Angefragt von {who}")
+            cards.append(embed)
+        if items:
+            head = [f"**{len(items)}** offene {'Anfrage' if len(items) == 1 else 'Anfragen'}"]
+            if active:
+                head[0] += f" · ⬇️ **{active}** {'Download' if active == 1 else 'Downloads'} aktiv"
+            if speed:
+                head[0] += f" · {speed_text(speed)}"
+        else:
+            head = ["📭 Keine offenen Anfragen. Alles Angefragte ist schon da."]
         if free is not None:
             minimum = self.settings.min_free_gb * GB
             head.append(f"💾 **Nur noch {size_text(free)} frei**, neue Anfragen sind gesperrt." if free < minimum
-                        else f"💾 Noch {size_text(free)} frei.")
-        embed.description = "\n".join(head + problems)
-        embed.set_footer(text=f"Stand {datetime.now(self.settings.zone):%H:%M} · 🔄 zum Aktualisieren klicken")
-        return embed
+                        else f"💾 Noch **{size_text(free)}** frei")
+        if len(items) > STATUS_CARDS:
+            head.append(f"… und {len(items) - STATUS_CARDS} weitere Anfragen")
+        summary = discord.Embed(title="📊 Status", description="\n".join(head + problems), color=discord.Color.blurple())
+        summary.set_footer(text=f"Stand {datetime.now(self.settings.zone):%H:%M} · 🔄 zum Aktualisieren unten klicken")
+        return [summary] + cards
 
     async def sync_approvals(self) -> None:
         """Posts Approve/Decline buttons for new pending requests (also those made in Seerr itself)
@@ -561,6 +604,7 @@ async def handle_approval(interaction: discord.Interaction, request_id: int, act
 
 # --- /status refresh (persistent, anyone may click) ---------------------------------------------
 STATUS_COOLDOWN = 10  # seconds between two refreshes of the same message
+STATUS_CARDS = 9  # one card per title; Discord allows 10 embeds per message, one is the summary
 
 
 class StatusRefresh(discord.ui.DynamicItem[discord.ui.Button], template=r"status:refresh"):
@@ -581,7 +625,7 @@ class StatusRefresh(discord.ui.DynamicItem[discord.ui.Button], template=r"status
         bot.status_clicks[key] = time.monotonic()
         try:
             await interaction.response.defer()
-            await interaction.edit_original_response(embed=await bot.status_embed(), view=status_view())
+            await interaction.edit_original_response(embeds=await bot.status_embeds(), view=status_view())
         except Exception as error:  # noqa: BLE001 - shown to who clicked, details in the log
             await report_error(interaction, error)
 
@@ -1150,7 +1194,7 @@ def build_commands(bot: SeerrBot) -> list[app_commands.Command]:
     @app_commands.command(name="status", description="Offene Anfragen, was gerade geladen wird und wie viel Platz frei ist")
     async def status(interaction: discord.Interaction) -> None:
         await interaction.response.defer(thinking=True)
-        await interaction.followup.send(embed=await bot.status_embed(), view=status_view())
+        await interaction.followup.send(embeds=await bot.status_embeds(), view=status_view())
 
     @app_commands.command(name="problem", description="Ein Problem mit einem Film oder einer Serie melden")
     @app_commands.describe(

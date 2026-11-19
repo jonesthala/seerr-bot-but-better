@@ -276,3 +276,111 @@ def progress_lines(kind: str, progress: Progress, live: dict[str, dict], now: da
     elif kind == "movie" and progress.have:
         lines.append("✅ Ist da, taucht gleich in Jellyfin auf")
     return lines
+
+
+# --- cards for /status (one embed per title) ------------------------------------------------------
+SHOWN_ACTIVE = 5  # downloads with their own bar per title
+MOVING = ("downloading", "importing", "queued")
+
+
+def emoji_bar(percent: int, width: int = 10, fill: str = "🟦") -> str:
+    filled = max(0, min(width, round(percent / 100 * width)))
+    return fill * filled + "⬜" * (width - filled)
+
+
+def _group(downloads: list[Download]) -> str:
+    """'S23E13–E17' for paused or stuck downloads that are single episodes in a row, else their labels."""
+    labels = [d.what for d in downloads if d.what]
+    singles = [lbl for lbl in labels if len(lbl) == 6 and lbl[0] == "S" and lbl[3] == "E"]
+    if singles and len(singles) == len(labels) and len({lbl[:3] for lbl in singles}) == 1:
+        numbers = sorted(int(lbl[4:]) for lbl in singles)
+        return f"{singles[0][:3]} Folge {format_numbers(numbers)}"
+    return ", ".join(labels) or f"{len(downloads)} Downloads"
+
+
+@dataclass(frozen=True)
+class Card:
+    """Everything /status shows for one title, as text pieces for an embed."""
+    headline: str  # big bar with percent, GB and time left
+    counts: str  # "📦 0 / 17 da · ⬇️ 12 laden · ⏸️ 5 pausiert"
+    active: list[str]  # downloads with their own bar
+    other: list[str]  # paused, stuck, blocked, grouped
+    missing: str  # what Sonarr/Radarr still look for
+    color: str  # "blue", "orange", "green", "gold"
+    speed: int  # bytes per second of this title's downloads
+
+
+def card(kind: str, progress: Progress, live: dict[str, dict], now: datetime) -> Card:
+    downloads = sorted(progress.downloads, key=lambda d: (STATE_ORDER.get(d.state, 9), -d.percent))
+    moving = [d for d in downloads if d.state in MOVING]
+    others = [d for d in downloads if d.state not in MOVING]
+    if kind == "tv" and progress.total:
+        done = progress.have + sum(d.percent / 100 * max(d.episodes, 1) for d in moving)
+        percent = round(100 * done / progress.total)
+    elif progress.have:
+        percent = 100
+    else:
+        percent = moving[0].percent if moving else 0
+    size = sum(d.size for d in moving)
+    loaded = sum(d.size - d.left for d in moving)
+    speed = sum(live.get(d.hash, {}).get("dlspeed") or 0 for d in moving)
+    etas = [d.eta for d in moving if d.eta]
+    headline = f"{emoji_bar(percent, fill='🟩' if percent >= 100 else '🟦')}  **{percent} %**"
+    if size:
+        headline += f"\n{loaded / 1e9:.1f} von {size / 1e9:.1f} GB"
+        if speed:
+            headline += f" · {speed_text(speed)}"
+        rest = eta_text(max(etas), now) if etas else ""
+        if rest:
+            headline += f" · fertig {rest}"
+    counts = ""
+    if kind == "tv":
+        def count(states: tuple[str, ...]) -> int:
+            return sum(max(d.episodes, 1) for d in downloads if d.state in states)
+        parts = [f"📦 **{progress.have}** von {progress.total} da"]
+        for emoji, label, states in (("⬇️", "laden", MOVING), ("⏸️", "pausiert", ("paused",)),
+                                     ("⚠️", "hängen", ("stalled", "blocked", "failed", "warning"))):
+            if count(states):
+                parts.append(f"{emoji} {count(states)} {label}")
+        if progress.upcoming:
+            parts.append(f"📅 {progress.upcoming} kommen noch")
+        counts = " · ".join(parts)
+    active = []
+    for d in moving[:SHOWN_ACTIVE]:
+        if d.state != "downloading":
+            active.append(download_line(d, None, now))
+            continue
+        line = f"`{d.what or 'Film'}` {emoji_bar(d.percent, 8)} **{d.percent} %**"
+        info = live.get(d.hash) or {}
+        extra = [speed_text(info["dlspeed"])] if isinstance(info.get("dlspeed"), int) else []
+        rest = eta_text(d.eta, now)
+        if rest:
+            extra.append(rest)
+        active.append(line + (f"\n{' · '.join(extra)}" if extra else ""))
+    if len(moving) > SHOWN_ACTIVE:
+        active.append(f"… und {len(moving) - SHOWN_ACTIVE} weitere")
+    other = []
+    for state, text in (("paused", "⏸️ **Pausiert:**"), ("stalled", "⏸️ **Hängt, keine Quellen:**"),
+                        ("queued", "⏳ **Wartet:**")):
+        group = [d for d in others if d.state == state]
+        if group:
+            other.append(f"{text} {_group(group)}")
+    for d in others:
+        if d.state in ("blocked", "failed", "warning"):
+            other.append(download_line(d, None, now))
+    missing = ""
+    searching = "sucht gerade" if progress.searching else "wartet auf ein passendes Release"
+    if kind == "tv" and progress.missing:
+        which = "; ".join(f"Staffel {s}: Folge {format_numbers(e)}" for s, e in sorted(progress.missing.items()))
+        missing = f"🔎 {which}\nSonarr {searching}"
+    elif kind == "movie" and not progress.have and not downloads:
+        missing = f"🔎 Radarr {searching}"
+    if percent >= 100:
+        color = "green"
+    elif moving:
+        color = "blue"
+    elif others:
+        color = "orange"
+    else:
+        color = "gold"
+    return Card(headline, counts, active, other, missing, color, speed)
