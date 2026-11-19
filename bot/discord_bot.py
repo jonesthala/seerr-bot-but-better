@@ -43,7 +43,15 @@ from .core import (
     shorten,
     size_text,
 )
-from .jellyfin import TAILSCALE_ADMIN, JellyfinClient, JellyfinError, check_name, suggest_name, welcome_text
+from .jellyfin import (
+    TAILSCALE_ADMIN,
+    JellyfinClient,
+    JellyfinError,
+    check_name,
+    suggest_name,
+    usage_line,
+    welcome_text,
+)
 from .seerr import SeerrClient
 from .store import FRIEND_APPROVED, FRIEND_DECLINED, FRIEND_PENDING, FRIEND_REVOKED, Approval, Friend, Store
 
@@ -417,6 +425,7 @@ async def handle_approval(interaction: discord.Interaction, request_id: int, act
 
 # --- Jellyfin accounts for friends (/jellyfin-zugang) -------------------------------------------
 LOGIN_COOLDOWN = 20  # seconds between two new passwords, so a double click doesn't void the first
+SPACE_TOP = 10  # titles shown by /speicher
 DECLINED_WAIT_DAYS = 7  # after a "no", asking again only after this long
 
 
@@ -1008,7 +1017,7 @@ def build_commands(bot: SeerrBot) -> list[app_commands.Command]:
 
 
 def friend_commands(bot: SeerrBot, requester) -> list[app_commands.Command]:
-    """/jellyfin-zugang for everyone who may request, the list and taking access away for admins."""
+    """/jellyfin-zugang for everyone who may request; for admins the list, taking access away and /speicher."""
     def friend_admin(interaction: discord.Interaction) -> bool:
         if bot.is_admin(interaction):
             return True
@@ -1068,4 +1077,25 @@ def friend_commands(bot: SeerrBot, requester) -> list[app_commands.Command]:
         embed.set_footer(text="✅ hat Zugang · ⏳ wartet · ❌ abgelehnt · 🚫 gesperrt")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    return [jellyfin_zugang, jellyfin_entziehen, jellyfin_liste]
+    @app_commands.command(name="speicher", description="Was am meisten Platz braucht und ob es jemand geschaut hat (nur Admins)")
+    @app_commands.check(friend_admin)
+    async def speicher(interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        usages = await asyncio.to_thread(bot.jellyfin.usage)
+        free = await asyncio.to_thread(bot.seerr.free_bytes)
+        requested = {(t.kind, t.tmdb_id): t.user_name for t in bot.store.requests.values()}
+        lines = [usage_line(rank, dataclasses.replace(u, name=escape(u.name)), size_text(u.size),
+                            escape(requested[(u.kind, u.tmdb_id)]) if (u.kind, u.tmdb_id) in requested else None,
+                            bot.settings.zone)
+                 for rank, u in enumerate(usages[:SPACE_TOP], start=1)]
+        total = sum(u.size for u in usages)
+        head = f"Bibliothek: {size_text(total)} in {len(usages)} Titeln"
+        if free is not None:
+            head += f", noch {size_text(free)} frei"
+        embed = discord.Embed(title="💾 Was am meisten Platz braucht", color=discord.Color.blurple(),
+                              description=(head + ".\n\n" + "\n".join(lines))[:4000] if lines
+                              else "📭 In der Bibliothek ist noch nichts.")
+        embed.set_footer(text="Löschen mit /löschen. Platz wird erst frei, wenn auch der Torrent weg ist.")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    return [jellyfin_zugang, jellyfin_entziehen, jellyfin_liste, speicher]

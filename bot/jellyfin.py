@@ -10,8 +10,11 @@ import logging
 import re
 import secrets
 import urllib.parse
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
+from .core import parse_time
 from .seerr import USER_AGENT, Fetch, http_fetch
 
 log = logging.getLogger("seerrbot.jellyfin")
@@ -21,6 +24,63 @@ PASSWORD_ALPHABET = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"  #
 PASSWORD_LENGTH = 14
 UNREACHABLE = "Jellyfin ist gerade nicht erreichbar. Versuch es in ein paar Minuten nochmals."
 TAILSCALE_ADMIN = "https://login.tailscale.com/admin/machines"
+
+
+@dataclass(frozen=True)
+class Usage:
+    """One movie or show in the library: how much space it takes and when anyone last watched it."""
+    name: str
+    kind: str  # "movie" or "tv"
+    size: int  # bytes
+    files: int
+    tmdb_id: int | None
+    last_played: datetime | None  # None: nobody started it yet
+    viewers: int  # how many Jellyfin users watched (part of) it
+
+
+def _tmdb(item: dict) -> int | None:
+    value = (item.get("ProviderIds") or {}).get("Tmdb")
+    return int(value) if isinstance(value, str) and value.isdigit() else None
+
+
+def _label(item: dict) -> str:
+    year = item.get("ProductionYear")
+    return f"{item.get('Name', '?')} ({year})" if year else str(item.get("Name", "?"))
+
+
+def library_usage(items: list[dict], series: list[dict], watched: dict[str, list[dict]]) -> list[Usage]:
+    """Movies and shows by size, largest first. items: movies and episodes with MediaSources; series: the shows;
+    watched: per Jellyfin user, the items with their UserData."""
+    shows = {s.get("Id"): s for s in series if isinstance(s, dict)}
+    groups: dict[str, dict] = {}
+    owner: dict[str, str] = {}  # item id → group id
+    for item in items:
+        if not isinstance(item, dict) or not item.get("Id"):
+            continue
+        episode = item.get("Type") == "Episode" and item.get("SeriesId")
+        key = item["SeriesId"] if episode else item["Id"]
+        source = shows.get(key, {"Name": item.get("SeriesName"), "Id": key}) if episode else item
+        group = groups.setdefault(key, {"name": _label(source), "kind": "tv" if episode else "movie",
+                                        "tmdb": _tmdb(source), "size": 0, "files": 0, "last": None, "viewers": set()})
+        sources = [m for m in item.get("MediaSources") or [] if isinstance(m, dict)]
+        group["size"] += sum(m.get("Size") or 0 for m in sources if isinstance(m.get("Size"), int))
+        group["files"] += 1
+        owner[item["Id"]] = key
+    for user_id, seen in watched.items():
+        for item in seen:
+            if not isinstance(item, dict):
+                continue
+            data = item.get("UserData") or {}
+            group = groups.get(owner.get(item.get("Id"), ""))
+            if group is None or not (data.get("Played") or data.get("PlaybackPositionTicks")):
+                continue
+            group["viewers"].add(user_id)
+            moment = parse_time(data.get("LastPlayedDate"))
+            if moment and (group["last"] is None or moment > group["last"]):
+                group["last"] = moment
+    found = [Usage(g["name"], g["kind"], g["size"], g["files"], g["tmdb"], g["last"], len(g["viewers"]))
+             for g in groups.values()]
+    return sorted(found, key=lambda u: u.size, reverse=True)
 
 
 class JellyfinError(Exception):
@@ -115,6 +175,19 @@ class JellyfinClient:
         wanted = name.casefold()
         return next((u for u in self.users() if str(u.get("Name", "")).casefold() == wanted), None)
 
+    def usage(self) -> list[Usage]:
+        """What takes the most space, and who watched it (for /speicher)."""
+        def items(**query: str) -> list[dict]:
+            data = self._call("GET", "/Items", {"Recursive": "true", **query})
+            found = data.get("Items") if isinstance(data, dict) else None
+            return [i for i in found if isinstance(i, dict)] if isinstance(found, list) else []
+
+        files = items(IncludeItemTypes="Movie,Episode", Fields="MediaSources,ProviderIds")
+        series = items(IncludeItemTypes="Series", Fields="ProviderIds")
+        watched = {str(u.get("Id")): items(userId=str(u.get("Id")), IncludeItemTypes="Movie,Episode", Fields="UserData")
+                   for u in self.users() if u.get("Id")}
+        return library_usage(files, series, watched)
+
     def folder_ids(self) -> list[str]:
         """Ids of the libraries friends may see (JELLYFIN_FRIEND_LIBRARIES); all if none are named."""
         data = self._call("GET", "/Library/VirtualFolders")
@@ -163,6 +236,17 @@ class JellyfinClient:
         password = new_password()
         self._call("POST", "/Users/Password", {"userId": user_id}, body={"NewPw": password, "ResetPassword": False})
         return password
+
+
+def usage_line(rank: int, usage: Usage, size: str, who: str | None, zone: Any) -> str:
+    """'3. **Loki (2021)** · 22 GB · 6 Dateien · 👀 zuletzt 15.11.2026, 2 Personen · von alex' for /speicher."""
+    files = "1 Datei" if usage.files == 1 else f"{usage.files} Dateien"
+    if usage.last_played is None:
+        seen = "💤 noch nie geschaut"
+    else:
+        people = "1 Person" if usage.viewers == 1 else f"{usage.viewers} Personen"
+        seen = f"👀 zuletzt {usage.last_played.astimezone(zone).strftime('%d.%m.%Y')}, {people}"
+    return f"{rank}. **{usage.name}** · {size} · {files} · {seen}" + (f" · von {who}" if who else "")
 
 
 def welcome_text(name: str, password: str, server_url: str, share_url: str) -> str:

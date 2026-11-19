@@ -57,6 +57,8 @@ to Radarr or Sonarr as usual.
 - The button shows the whole guide, the Tailscale share link and a **fresh password that only this person
   sees**. Passwords are never stored; a new click makes a new one, so it also works as "forgot password".
 - **`/jellyfin-liste`** and **`/jellyfin-entziehen <person>`** (admins only): who has access, and block an account.
+- **`/speicher`** (admins only): the ten titles that take the most space, how many files, when anyone last
+  watched them and who requested them, plus free space. Helps to decide what `/löschen` should remove.
 
 Seasons and quality are chosen per request; single episodes can't be requested, because Seerr only
 requests whole seasons.

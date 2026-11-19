@@ -9,8 +9,10 @@ from bot.jellyfin import (
     JellyfinError,
     check_name,
     friend_policy,
+    library_usage,
     new_password,
     suggest_name,
+    usage_line,
     welcome_text,
 )
 from bot.store import FRIEND_APPROVED, FRIEND_DECLINED, Friend, Store
@@ -142,6 +144,57 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(policy["MaxActiveSessions"], 2)
         self.assertFalse(policy["IsAdministrator"])
         self.assertEqual(policy["RemoteClientBitrateLimit"], 0)
+
+
+MOVIE = {"Id": "m1", "Type": "Movie", "Name": "Sintel", "ProductionYear": 2010, "ProviderIds": {"Tmdb": "45745"},
+         "MediaSources": [{"Size": 600}]}
+EPISODES = [{"Id": f"e{n}", "Type": "Episode", "SeriesId": "s1", "SeriesName": "Loki", "MediaSources": [{"Size": 500}]}
+            for n in range(3)]
+SERIES = [{"Id": "s1", "Name": "Loki", "ProductionYear": 2021, "ProviderIds": {"Tmdb": "84958"}}]
+
+
+class UsageTest(unittest.TestCase):
+    def test_groups_sizes_and_watching(self):
+        watched = {
+            "u1": [{"Id": "e1", "UserData": {"Played": True, "LastPlayedDate": "2026-11-15T20:12:33.1234567Z"}},
+                   {"Id": "m1", "UserData": {"Played": False, "PlaybackPositionTicks": 0}}],
+            "u2": [{"Id": "e2", "UserData": {"Played": False, "PlaybackPositionTicks": 1200,
+                                             "LastPlayedDate": "2026-11-10T08:00:00Z"}}],
+        }
+        loki, sintel = library_usage([MOVIE, *EPISODES], SERIES, watched)
+        self.assertEqual((loki.name, loki.kind, loki.size, loki.files, loki.tmdb_id), ("Loki (2021)", "tv", 1500, 3, 84958))
+        self.assertEqual(loki.viewers, 2)
+        self.assertEqual(loki.last_played.day, 15)  # the latest of both
+        self.assertEqual((sintel.name, sintel.kind, sintel.tmdb_id), ("Sintel (2010)", "movie", 45745))
+        self.assertIsNone(sintel.last_played)  # opened but never played
+        self.assertEqual(sintel.viewers, 0)
+
+    def test_lines(self):
+        loki, sintel = library_usage([MOVIE, *EPISODES], SERIES, {
+            "u1": [{"Id": "e0", "UserData": {"Played": True, "LastPlayedDate": "2026-11-15T23:30:00Z"}}]})
+        zone = Settings.__dataclass_fields__["zone"].default
+        self.assertEqual(usage_line(1, loki, "1.5 GB", "alex", zone),
+                         "1. **Loki (2021)** · 1.5 GB · 3 Dateien · 👀 zuletzt 15.11.2026, 1 Person · von alex")
+        self.assertEqual(usage_line(2, sintel, "0.6 GB", None, zone),
+                         "2. **Sintel (2010)** · 0.6 GB · 1 Datei · 💤 noch nie geschaut")
+
+    def test_client_asks_per_user(self):
+        calls = []
+
+        def fake(method, url, headers, body):
+            calls.append(url)
+            if url.endswith("/Users"):
+                return 200, [{"Id": "u1", "Name": "admin"}]
+            if "IncludeItemTypes=Series" in url:
+                return 200, {"Items": SERIES}
+            if "userId=u1" in url:
+                return 200, {"Items": [{"Id": "e0", "UserData": {"Played": True}}]}
+            return 200, {"Items": [MOVIE, *EPISODES]}
+
+        usages = JellyfinClient(BASE, "k", fetch=fake).usage()
+        self.assertEqual([u.name for u in usages], ["Loki (2021)", "Sintel (2010)"])
+        self.assertEqual(usages[0].viewers, 1)
+        self.assertTrue(any("Fields=MediaSources" in c for c in calls))
 
 
 class WelcomeTest(unittest.TestCase):
