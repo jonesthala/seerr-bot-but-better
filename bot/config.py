@@ -118,6 +118,19 @@ class Settings:
     tailscale_share_url: str = ""  # multi-use share invite for the Jellyfin machine
     friend_libraries: tuple[str, ...] = ()
     friend_bitrate_mbit: int = 4
+    # /löschen also removes the torrents (qBittorrent login, and Sonarr/Radarr to know which torrents)
+    qbittorrent_url: str = ""
+    qbittorrent_username: str = ""
+    qbittorrent_password: str = ""
+    sonarr_url: str = ""
+    sonarr_api_key: str = ""
+    radarr_url: str = ""
+    radarr_api_key: str = ""
+
+    @property
+    def torrent_cleanup_enabled(self) -> bool:
+        qbit = all((self.qbittorrent_url, self.qbittorrent_username, self.qbittorrent_password))
+        return qbit and bool((self.sonarr_url and self.sonarr_api_key) or (self.radarr_url and self.radarr_api_key))
 
     @property
     def friends_enabled(self) -> bool:
@@ -207,6 +220,13 @@ class Settings:
             tailscale_share_url=share_url,
             friend_libraries=_names("JELLYFIN_FRIEND_LIBRARIES"),
             friend_bitrate_mbit=bitrate,
+            qbittorrent_url=_url("QBITTORRENT_URL"),
+            qbittorrent_username=_text("QBITTORRENT_USERNAME"),
+            qbittorrent_password=_text("QBITTORRENT_PASSWORD"),
+            sonarr_url=_url("SONARR_URL"),
+            sonarr_api_key=_text("SONARR_API_KEY"),
+            radarr_url=_url("RADARR_URL"),
+            radarr_api_key=_text("RADARR_API_KEY"),
         )
 
     def page_url(self, kind: str, tmdb_id: int) -> str | None:

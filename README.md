@@ -54,6 +54,8 @@ to Radarr or Sonarr as usual.
   bot posts once in the channel when space gets low and once when it is fine again.
 - **`/löschen <titel>`** (admins only): pick a movie or show from the library and delete it, files
   included, after a second confirmation click. It is reset in Seerr, so it can be requested again later.
+  With qBittorrent access (setup step 5) it also removes the title's torrents with their files, so the space
+  is really freed, and says how much.
 - **Only where it belongs.** The bot answers in one channel; optionally only members with a role may request.
 - **Your search, your buttons.** Only the person who searched can pick and request.
 
@@ -154,6 +156,25 @@ The three commands appear once all four required values are set. Taking access a
 account, so the person can't watch anything any more. The Tailscale share stays until you remove it in
 Tailscale (Machines → Jellyfin → Share); the bot has no Tailscale access.
 
+### 5. Remove the torrents too when deleting (optional)
+
+With hardlinks, a deleted title keeps taking space while its torrent is still seeding. To remove the torrents
+as well, the bot needs to know which ones belong to the title (Sonarr's and Radarr's history) and to log in
+to qBittorrent (WebUI user and password; qBittorrent 4.x has no API keys):
+
+```env
+QBITTORRENT_URL=http://192.168.1.20:8080
+QBITTORRENT_USERNAME=admin
+QBITTORRENT_PASSWORD=...
+SONARR_URL=http://192.168.1.20:8989
+SONARR_API_KEY=...
+RADARR_URL=http://192.168.1.20:7878
+RADARR_API_KEY=...
+```
+
+Only torrents listed in the history of that title are removed, nothing else. If Sonarr/Radarr or qBittorrent
+can't be asked, nothing is deleted. Files you added by hand (not through Sonarr/Radarr) stay in qBittorrent.
+
 Without Docker (Python 3.11 or newer):
 
 ```bash
@@ -183,6 +204,8 @@ python -m bot    # remembers its state in ./data unless DATA_DIR says otherwise
 | `TAILSCALE_SHARE_URL` | empty | `/jellyfin-zugang`: multi-use share link for the Jellyfin machine |
 | `JELLYFIN_FRIEND_LIBRARIES` | empty = all | Libraries friends may see, by name, e.g. `Movies,Shows` |
 | `JELLYFIN_FRIEND_BITRATE_MBIT` | `4` | Bitrate limit for friends streaming from outside; `0` = none |
+| `QBITTORRENT_URL`, `QBITTORRENT_USERNAME`, `QBITTORRENT_PASSWORD` | empty | `/löschen` also removes the torrents (with `SONARR_*` or `RADARR_*`) |
+| `SONARR_URL`, `SONARR_API_KEY`, `RADARR_URL`, `RADARR_API_KEY` | empty | Only read: which torrents belong to a show or movie |
 | `DATA_DIR` | `data` (`/data` in Docker) | Where `state.json` is kept |
 | `SEERR_URL` | `http://localhost:5055` | How the bot reaches Seerr |
 | `SEERR_API_KEY` | – | Seerr API key |
@@ -201,6 +224,8 @@ python -m bot    # remembers its state in ./data unless DATA_DIR says otherwise
 - The bot only ever mentions the person who made a request, never `@everyone` or roles.
 - `state.json` holds Discord user IDs and display names of people who requested something, and for Jellyfin
   accounts the user name, the account ID and the state. Never a password.
+- With `QBITTORRENT_*` the bot can remove torrents and their files. It only ever removes those Sonarr/Radarr list
+  for the title an admin deletes. Sonarr and Radarr are only read.
 - The Jellyfin API key can do everything an admin can. Friends' accounts are only created after an admin's
   click, and a password is only shown to the person whose button it is.
 

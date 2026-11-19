@@ -589,12 +589,20 @@ def pick_profiles(details: Any, wanted: list[str]) -> list[tuple[int, str]]:
     return [by_name[name.strip().lower()] for name in wanted if name.strip().lower() in by_name]
 
 
-def deleted_text(title: Title) -> str:
+def deleted_text(title: Title, removed: tuple[int, int] | None = None, problem: str | None = None) -> str:
+    """After /löschen. removed: (torrents, bytes) taken out of qBittorrent, None if the bot can't do that."""
     what = "Der Film" if title.kind == "movie" else "Die Serie mit allen Staffeln"
-    return (
-        f"🗑️ {what} ist gelöscht, auch die Dateien. Wird der Download in qBittorrent noch geteilt, "
-        "wird der Platz erst frei, wenn der Torrent dort entfernt ist."
-    )
+    if problem:
+        return f"🗑️ {what} ist gelöscht, auch die Dateien. ⚠️ Die Torrents sind noch in qBittorrent: {problem}"
+    if removed is None:
+        return (f"🗑️ {what} ist gelöscht, auch die Dateien. Wird der Download in qBittorrent noch geteilt, "
+                "wird der Platz erst frei, wenn der Torrent dort entfernt ist.")
+    count, size = removed
+    if not count:
+        return f"🗑️ {what} ist gelöscht, auch die Dateien. In qBittorrent lief dazu kein Torrent mehr."
+    torrents = "1 Torrent" if count == 1 else f"{count} Torrents"
+    return (f"🗑️ {what} ist gelöscht, mit allen Dateien und {torrents} in qBittorrent. "
+            f"Frei geworden: etwa {size_text(size)}.")
 
 
 def request_done_text(kind: str, request_status: int, notify: bool = False) -> str:

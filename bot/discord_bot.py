@@ -59,6 +59,7 @@ from .jellyfin import (
     welcome_text,
 )
 from .seerr import SeerrClient
+from .torrents import TorrentCleaner, TorrentError
 from .store import FRIEND_APPROVED, FRIEND_DECLINED, FRIEND_PENDING, FRIEND_REVOKED, Approval, Friend, Store
 
 log = logging.getLogger("seerrbot.discord")
@@ -130,7 +131,7 @@ async def report_error(interaction: discord.Interaction, error: BaseException) -
         message = str(error)
     elif isinstance(error, app_commands.CheckFailure):
         message = "🔒 Das darfst du hier nicht."
-    elif isinstance(error, (SeerrError, JellyfinError)):
+    elif isinstance(error, (SeerrError, JellyfinError, TorrentError)):
         message = f"⚠️ {error}"
     else:
         log.error("Interaction failed", exc_info=error)
@@ -163,7 +164,7 @@ class GuardedTree(app_commands.CommandTree):
 
 class SeerrBot(discord.Client):
     def __init__(self, settings: Settings, seerr: SeerrClient, store: Store | None = None,
-                 jellyfin: JellyfinClient | None = None) -> None:
+                 jellyfin: JellyfinClient | None = None, torrents: TorrentCleaner | None = None) -> None:
         intents = discord.Intents.none()
         intents.guilds = True
         # Only the requester may be pinged, never @everyone or roles (titles come from TMDB).
@@ -172,6 +173,7 @@ class SeerrBot(discord.Client):
         self.settings = settings
         self.seerr = seerr
         self.jellyfin = jellyfin  # None: /jellyfin-zugang is not set up
+        self.torrents = torrents  # None: /löschen leaves the torrents in qBittorrent
         self.store = store if store is not None else Store(settings.data_dir or None)
         self.tree = GuardedTree(self)
         self.space = SpaceWatch(settings.min_free_gb * GB)
@@ -883,11 +885,22 @@ class DeleteButton(discord.ui.Button):
             await interaction.response.edit_message(embed=picker.embed(picker.current), view=picker)
             return
         await interaction.response.defer()
-        title = picker.current
-        await asyncio.to_thread(picker.bot.seerr.delete, title)
+        bot, title = picker.bot, picker.current
+        torrents: list[dict] = []
+        if bot.torrents is not None:
+            # Before deleting: Sonarr/Radarr forget the downloads with the title. If that or qBittorrent fails,
+            # nothing is deleted, so it never ends up half done.
+            torrents = await asyncio.to_thread(bot.torrents.prepare, title.kind, title.tmdb_id)
+        await asyncio.to_thread(bot.seerr.delete, title)
         picker.stop()
-        embed = title_embed(picker.bot, title, footer=f"Gelöscht von {interaction.user.display_name}")
-        embed.set_field_at(0, name="Status", value=deleted_text(title), inline=False)
+        removed, problem = None, None
+        if bot.torrents is not None:
+            try:
+                removed = await asyncio.to_thread(bot.torrents.remove, torrents)
+            except TorrentError as error:
+                problem = str(error)
+        embed = title_embed(bot, title, footer=f"Gelöscht von {interaction.user.display_name}")
+        embed.set_field_at(0, name="Status", value=deleted_text(title, removed, problem), inline=False)
         await interaction.edit_original_response(embed=embed, view=None)
 
 
@@ -909,9 +922,11 @@ class DeletePicker(Picker):
         embed = title_embed(self.bot, title, footer)
         if self.armed:
             what = "Der Film" if title.kind == "movie" else "Die ganze Serie mit allen Staffeln"
+            torrents = " und ihre Torrents in qBittorrent" if self.bot.torrents is not None else ""
             embed.add_field(
                 name="⚠️ Wirklich löschen?",
-                value=f"{what} wird aus Radarr/Sonarr entfernt, **die Dateien sind danach weg**. Zum Bestätigen nochmals klicken.",
+                value=f"{what} wird aus Radarr/Sonarr entfernt, **die Dateien{torrents} sind danach weg**. "
+                      "Zum Bestätigen nochmals klicken.",
                 inline=False,
             )
             embed.color = discord.Color.red()
