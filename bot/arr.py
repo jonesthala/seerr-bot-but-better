@@ -3,7 +3,8 @@
 - which downloads belonged to a title (torrent hashes, for /löschen)
 - what is going on right now (for /status): episodes there, missing and still to come, the downloads with
   their state, and whether a search is running
-- /folgen: the shows and their episodes, and the only writes: monitor single episodes and search them
+- /folgen: the shows and their episodes; monitor single episodes and search them
+- after watching: delete single episode files and stop monitoring them, so they aren't fetched again
 """
 from __future__ import annotations
 
@@ -168,6 +169,40 @@ class ArrClient:
             self._request("PUT", "/episode/monitor", body={"episodeIds": episode_ids, "monitored": True})
         if search_ids:
             self._request("POST", "/command", body={"name": "EpisodeSearch", "episodeIds": search_ids})
+
+    def find_episodes(self, tmdb_id: int | None, keys: list[tuple[int, int]]) -> tuple[dict | None, list[dict]]:
+        """The show with this TMDB id and its episodes (season, episode) in keys."""
+        show = next((s for s in self.series() if tmdb_id and s.get("tmdbId") == tmdb_id), None)
+        if show is None:
+            return None, []
+        wanted = {tuple(k) for k in keys}
+        return show, [e for e in self.episodes(show["id"]) if (e.get("seasonNumber"), e.get("episodeNumber")) in wanted]
+
+    def episode_hashes(self, series_id: int, episode_ids: list[int]) -> list[str]:
+        """Torrent hashes these episodes were downloaded with (Sonarr's history)."""
+        wanted = set(episode_ids)
+        history = self._get("/history/series", {"seriesId": series_id}) or []
+        return sorted({str(h["downloadId"]).lower() for h in history
+                       if isinstance(h, dict) and h.get("episodeId") in wanted and h.get("downloadId")})
+
+    def queue_hashes(self) -> set[str]:
+        """Torrents Sonarr/Radarr are still downloading or importing: these must not be removed."""
+        data = self._get("/queue", {"pageSize": 500})
+        records = data.get("records") if isinstance(data, dict) else None
+        return {str(r["downloadId"]).lower() for r in records or [] if isinstance(r, dict) and r.get("downloadId")}
+
+    def drop_episodes(self, episodes: list[dict]) -> int:
+        """Stops monitoring these episodes (so Sonarr doesn't fetch them again) and deletes their files.
+        Returns the size of the deleted files in bytes."""
+        if not episodes:
+            return 0
+        self._request("PUT", "/episode/monitor", body={"episodeIds": [e["id"] for e in episodes], "monitored": False})
+        freed = 0
+        for file_id in sorted({e["episodeFileId"] for e in episodes if isinstance(e.get("episodeFileId"), int) and e["episodeFileId"]}):
+            info = self._get(f"/episodefile/{file_id}")
+            freed += info.get("size") or 0 if isinstance(info, dict) else 0
+            self._request("DELETE", f"/episodefile/{file_id}")
+        return freed
 
     def queued_titles(self) -> dict[int, str]:
         """TMDB id → 'Name (Jahr)' of everything in the download queue (for /status, also without a request)."""

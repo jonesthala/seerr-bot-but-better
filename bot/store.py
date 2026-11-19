@@ -14,7 +14,7 @@ import logging
 import os
 import tempfile
 import time
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Callable
 
@@ -23,6 +23,8 @@ log = logging.getLogger("seerrbot.store")
 FILE_NAME = "state.json"
 KEEP_DAYS = 90  # finished requests are forgotten after this; longer than any sensible limit window
 KEEP_APPROVALS = 200  # closed approval messages to remember
+KEEP_WATCHED_IDS = 3000  # Jellyfin items already asked about
+KEEP_QUESTIONS_DAYS = 30  # answered 'geschaut, löschen?' questions
 
 
 @dataclass
@@ -63,6 +65,25 @@ class Friend:
     decided: float = 0.0
 
 
+@dataclass
+class WatchQuestion:
+    """'Geschaut, löschen?' for a movie, or for the episodes of one show watched since the last check."""
+    kind: str  # "movie" or "tv"
+    tmdb_id: int | None  # the movie, or the show
+    label: str
+    series_id: str = ""  # Jellyfin id of the show
+    episodes: list[list[int]] = field(default_factory=list)  # [season, episode]
+    item_ids: list[str] = field(default_factory=list)  # Jellyfin ids of what was watched
+    viewers: list[str] = field(default_factory=list)  # Jellyfin user names
+    size: int = 0
+    qid: int = 0
+    created: float = 0.0
+    state: str = "open"  # open, deleted, kept
+    text: str = ""  # the question as sent
+    messages: list[list[int]] = field(default_factory=list)  # [channel id, message id] of each copy
+    answer: str = ""
+
+
 def _load_items(cls: type, items: Any) -> list:
     names = {f.name for f in fields(cls)}
     loaded = []
@@ -92,6 +113,10 @@ class Store:
         # download brake: on or off, and the torrents it paused (only these are started again)
         self.brake_active = False
         self.brake_hashes: list[str] = []
+        # "geschaut, löschen?": from when on watching counts, what was asked about already, the questions
+        self.watch_since = ""
+        self.watch_asked: list[str] = []
+        self.watch_questions: dict[int, WatchQuestion] = {}
         self._load()
 
     # --- file ------------------------------------------------------------------
@@ -125,6 +150,10 @@ class Store:
         brake = data.get("brake") if isinstance(data.get("brake"), dict) else {}
         self.brake_active = bool(brake.get("active"))
         self.brake_hashes = [str(h) for h in brake.get("hashes") or [] if isinstance(h, str)]
+        watched = data.get("watched") if isinstance(data.get("watched"), dict) else {}
+        self.watch_since = str(watched.get("since") or "")
+        self.watch_asked = [str(i) for i in watched.get("asked") or [] if isinstance(i, str)]
+        self.watch_questions = {q.qid: q for q in _load_items(WatchQuestion, watched.get("questions"))}
 
     def save(self) -> None:
         if self.path is None:
@@ -138,6 +167,8 @@ class Store:
                      "pending": {str(k): {"users": users, "since": since} for k, (users, since) in self.pending_abos.items()}},
             "digest": self.digest,
             "brake": {"active": self.brake_active, "hashes": self.brake_hashes},
+            "watched": {"since": self.watch_since, "asked": self.watch_asked,
+                        "questions": [asdict(q) for q in self.watch_questions.values()]},
         }
         tmp = None
         try:
@@ -159,6 +190,9 @@ class Store:
     def _prune(self) -> None:
         cutoff = self._now() - KEEP_DAYS * 86400
         self.requests = {k: t for k, t in self.requests.items() if not (t.notified and t.created < cutoff)}
+        old = self._now() - KEEP_QUESTIONS_DAYS * 86400
+        self.watch_questions = {k: q for k, q in self.watch_questions.items() if q.state == "open" or q.created >= old}
+        self.watch_asked = self.watch_asked[-KEEP_WATCHED_IDS:]
         closed = sorted(k for k, a in self.approvals.items() if a.closed)
         for key in closed[:-KEEP_APPROVALS] if len(closed) > KEEP_APPROVALS else []:
             del self.approvals[key]
@@ -298,6 +332,19 @@ class Store:
         hashes, self.brake_active, self.brake_hashes = self.brake_hashes, False, []
         self.save()
         return hashes
+
+    # --- geschaut, löschen? -----------------------------------------------------------
+    def add_watch_question(self, question: WatchQuestion) -> WatchQuestion:
+        question.qid = max(self.watch_questions, default=0) + 1
+        question.created = self._now()
+        self.watch_questions[question.qid] = question
+        self.watch_asked += [i for i in question.item_ids if i not in self.watch_asked]
+        self.save()
+        return question
+
+    def set_watch_since(self, when: str) -> None:
+        self.watch_since = when
+        self.save()
 
     def set_digest(self, key: str) -> None:
         self.digest = key

@@ -135,6 +135,14 @@ class TorrentCleaner:
         hashes = arr.download_ids(tmdb_id) if arr is not None else []
         return self.qbit.torrents(hashes)
 
+    def remove_finished(self, hashes: list[str], busy: set[str]) -> tuple[int, int, int]:
+        """After deleting watched episodes: removes their torrents with files, but only finished ones that
+        Sonarr isn't importing (a season pack may still be busy). Returns (removed, their size, left alone)."""
+        found = self.qbit.torrents(hashes)
+        done = [t for t in found if (t.get("progress") or 0) >= 1 and str(t.get("hash")).lower() not in busy]
+        count, size = self.remove(done)
+        return count, size, len(found) - len(done)
+
     def remove(self, torrents: list[dict]) -> tuple[int, int]:
         """After deleting: removes them with their files; returns (how many, their size in bytes)."""
         hashes = [str(t["hash"]) for t in torrents if t.get("hash")]

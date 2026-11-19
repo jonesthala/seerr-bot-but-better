@@ -46,6 +46,7 @@ from .core import (
     space_text,
     new_line,
     next_allowed,
+    parse_time,
     request_done_text,
     shorten,
     size_text,
@@ -73,6 +74,7 @@ from .extras import (
     brake_released_text,
     event_description,
     event_end,
+    episodes_deleted_text,
     item_label,
     parse_episodes,
     parse_when,
@@ -82,9 +84,12 @@ from .extras import (
     plan_episodes,
     plan_lines,
     select_episodes,
+    watched_questions,
+    watched_text,
 )
 from .torrents import QbitClient, TorrentCleaner, TorrentError
-from .store import FRIEND_APPROVED, FRIEND_DECLINED, FRIEND_PENDING, FRIEND_REVOKED, Approval, Friend, Store
+from .store import (FRIEND_APPROVED, FRIEND_DECLINED, FRIEND_PENDING, FRIEND_REVOKED, Approval, Friend, Store,
+                    WatchQuestion)
 
 log = logging.getLogger("seerrbot.discord")
 
@@ -99,6 +104,7 @@ AUTOCOMPLETE_SECONDS = 2.5  # Discord gives up after 3 s
 MAX_CHECKS_PER_RUN = 30
 BRAKE_MINUTES = 1  # the download brake looks this often at the free space
 LIBRARY_CACHE_SECONDS = 600  # movies, shows and genres for /zufall and /filmabend
+WATCHED_MINUTES = 5  # how often Jellyfin is asked what was watched
 NO_ROLE = "🔒 Anfragen dürfen nur Leute mit der Rolle für Film- und Serienwünsche."
 NO_ADMIN = "🔒 Löschen dürfen nur Admins."
 NO_DELETING = "🔒 Löschen ist nicht eingerichtet: Es fehlen `DISCORD_ADMIN_USER_IDS` oder `DISCORD_ADMIN_ROLE_ID`."
@@ -208,6 +214,7 @@ class SeerrBot(discord.Client):
         self.space = SpaceWatch(settings.min_free_gb * GB)
         self.profiles: dict[str, list[tuple[int, str]]] = {"movie": [], "tv": []}
         self._approval_lock = asyncio.Lock()
+        self._watch_lock = asyncio.Lock()
         self._friend_lock = asyncio.Lock()
         self.login_clicks: dict[int, float] = {}  # Discord user → when the last password was made
         self._series: tuple[float, list[tuple[str, str, int | None]]] = (0.0, [])  # (when loaded, shows) for /abo
@@ -223,12 +230,14 @@ class SeerrBot(discord.Client):
         for command in build_commands(self):
             self.tree.add_command(command, guild=guild)
         await self.tree.sync(guild=guild)
-        self.add_dynamic_items(ApprovalButton, FriendButton, LoginButton, StatusRefresh)  # work after a restart
+        self.add_dynamic_items(ApprovalButton, FriendButton, LoginButton, StatusRefresh, WatchedButton)  # after a restart
         await self.load_profiles()
         self.space_loop.start()
         self.watch_loop.start()
         if self.qbit is not None and self.settings.brake_free_gb > 0:
             self.brake_loop.start()
+        if self.jellyfin is not None and self.settings.watched_ask and self.settings.has_admins:
+            self.watched_loop.start()
         if self.settings.weekly_digest:
             self.digest_loop.start()
         if self.jellyfin is not None:
@@ -350,11 +359,19 @@ class SeerrBot(discord.Client):
         except Exception:  # noqa: BLE001 - the loop must keep running
             log.exception("Download brake check failed")
 
+    @tasks.loop(minutes=WATCHED_MINUTES)
+    async def watched_loop(self) -> None:
+        try:
+            await self.check_watched()
+        except Exception:  # noqa: BLE001 - the loop must keep running
+            log.exception("Watched check failed")
+
     @space_loop.before_loop
     @watch_loop.before_loop
     @digest_loop.before_loop
     @abo_loop.before_loop
     @brake_loop.before_loop
+    @watched_loop.before_loop
     async def _wait_until_ready(self) -> None:
         await self.wait_until_ready()
 
@@ -482,6 +499,123 @@ class SeerrBot(discord.Client):
             self.store.brake_release()
             log.info("Download brake released: %s free, resumed %d downloads", size_text(free), len(still))
             await self.post(brake_released_text(free, len(still)))
+
+    async def delete_title(self, title: Title) -> tuple[bool, str]:
+        """Deletes a movie or show with its files, and its torrents if the bot may (/löschen, and after watching).
+        Returns (deleted, the status text)."""
+        arr = self.arrs.get(title.kind)
+        if arr is not None and not await asyncio.to_thread(arr.manages, title.tmdb_id):
+            # The files were there before Sonarr/Radarr: Seerr would say "deleted" and leave them on the disk.
+            folder = None
+            if self.jellyfin is not None:
+                try:
+                    folder = await asyncio.to_thread(self.jellyfin.folder_name, title.kind, title.tmdb_id)
+                except JellyfinError:
+                    pass
+            return False, unmanaged_text(title, arr.name, folder)
+        torrents: list[dict] = []
+        if self.torrents is not None:
+            # Before deleting: Sonarr/Radarr forget the downloads with the title. If that or qBittorrent fails,
+            # nothing is deleted, so it never ends up half done.
+            torrents = await asyncio.to_thread(self.torrents.prepare, title.kind, title.tmdb_id)
+        await asyncio.to_thread(self.seerr.delete, title)
+        removed, problem = None, None
+        if self.torrents is not None:
+            try:
+                removed = await asyncio.to_thread(self.torrents.remove, torrents)
+            except TorrentError as error:
+                problem = str(error)
+        return True, deleted_text(title, removed, problem)
+
+    async def delete_watched(self, question: WatchQuestion) -> str:
+        """'Löschen' under a 'Geschaut' question: the movie as with /löschen, or just the watched episodes."""
+        if question.tmdb_id is None:
+            return "⚠️ Ohne TMDB-Nummer in Jellyfin weiss der Bot nicht, was das ist. Bitte von Hand löschen."
+        if question.kind == "movie":
+            title = await asyncio.to_thread(self.seerr.details, "movie", question.tmdb_id)
+            if not title.in_library:
+                return "ℹ️ Der Film ist schon weg."
+            return (await self.delete_title(title))[1]
+        sonarr = self.arrs.get("tv")
+        if sonarr is None:
+            return "⚠️ Sonarr ist nicht eingerichtet (`SONARR_URL`), einzelne Folgen kann der Bot nicht löschen."
+        show, episodes = await asyncio.to_thread(sonarr.find_episodes, question.tmdb_id,
+                                                 [(s, e) for s, e in question.episodes])
+        if show is None:
+            return "⚠️ Sonarr kennt diese Serie nicht, die Folgen lagen schon vorher da. Bitte von Hand löschen."
+        with_file = [e for e in episodes if e.get("hasFile")]
+        if not with_file:
+            return "ℹ️ Diese Folgen sind schon weg."
+        hashes = await asyncio.to_thread(sonarr.episode_hashes, show["id"], [e["id"] for e in with_file])
+        busy = await asyncio.to_thread(sonarr.queue_hashes)
+        freed = await asyncio.to_thread(sonarr.drop_episodes, with_file)
+        removed, problem = None, None
+        if self.torrents is not None:
+            try:
+                removed = await asyncio.to_thread(self.torrents.remove_finished, hashes, busy)
+            except TorrentError as error:
+                problem = str(error)
+        return episodes_deleted_text(len(with_file), freed, removed, problem)
+
+    async def not_watched_by(self, question: WatchQuestion, users: list[dict]) -> list[str]:
+        """Other Jellyfin users who haven't finished it: for a movie everyone else, for episodes those who
+        started the show."""
+        others = []
+        for user in users:
+            name = str(user.get("Name") or "")
+            if not user.get("Id") or name in question.viewers:
+                continue
+            ids = question.item_ids + ([question.series_id] if question.series_id else [])
+            data = await asyncio.to_thread(self.jellyfin.user_data, str(user["Id"]), ids)
+            if question.kind == "tv":
+                show = data.get(question.series_id, {})
+                started = (show.get("PlayedPercentage") or 0) > 0 or show.get("Played")
+                if started and not all(data.get(i, {}).get("Played") for i in question.item_ids):
+                    others.append(name)
+            elif not all(data.get(i, {}).get("Played") for i in question.item_ids):
+                others.append(name)
+        return others
+
+    async def check_watched(self) -> None:
+        """Asks the admins about movies and episodes watched to the end since the last look."""
+        if self.jellyfin is None:
+            return
+        started = datetime.now(timezone.utc)
+        since = parse_time(self.store.watch_since)
+        if since is None:  # first start: only what is watched from now on counts
+            self.store.set_watch_since(started.isoformat())
+            return
+        users = [u for u in await asyncio.to_thread(self.jellyfin.users) if u.get("Id")]
+        played = {str(u["Id"]): (str(u.get("Name") or "?"), await asyncio.to_thread(self.jellyfin.recently_played, str(u["Id"])))
+                  for u in users}
+        series_tmdb = {sid: tmdb for sid, _, tmdb in await self.series_list()}
+        for question in watched_questions(played, since, set(self.store.watch_asked), series_tmdb):
+            try:
+                others = await self.not_watched_by(question, users)
+            except JellyfinError:
+                others = []
+            question.viewers = [escape(v) for v in question.viewers]
+            question.label = escape(question.label)
+            question.text = watched_text(question, [escape(o) for o in others])
+            question = self.store.add_watch_question(question)
+            question.messages = await self.ask_admins(question.text, lambda q=question.qid: watched_view(q))
+            self.store.save()
+        self.store.set_watch_since(started.isoformat())
+
+    async def ask_admins(self, text: str, make_view) -> list[list[int]]:
+        """A DM to every admin listed by id; without any, in the approvals channel. Returns the messages."""
+        sent = []
+        for user_id in sorted(self.settings.admin_user_ids):
+            try:
+                user = self.get_user(user_id) or await self.fetch_user(user_id)
+                message = await user.send(text, view=make_view())
+                sent.append([message.channel.id, message.id])
+            except discord.HTTPException:
+                log.info("No DM possible to admin %s", user_id)
+        if not sent:
+            message = await self.post(text, view=make_view(), channel_id=self.settings.approvals_channel)
+            sent.append([message.channel.id, message.id])
+        return sent
 
     async def status_embeds(self) -> list[discord.Embed]:
         """/status: a summary card, then one card per open request with bars, episodes and downloads, then
@@ -715,6 +849,68 @@ async def handle_approval(interaction: discord.Interaction, request_id: int, act
 
 
 # --- /status refresh (persistent, anyone may click) ---------------------------------------------
+class WatchedButton(discord.ui.DynamicItem[discord.ui.Button], template=r"watched:(?P<action>del|keep):(?P<id>[0-9]+)"):
+    """Löschen / Behalten under a 'Geschaut' question; works after a restart."""
+
+    def __init__(self, question_id: int, action: str) -> None:
+        delete = action == "del"
+        super().__init__(discord.ui.Button(
+            label="Löschen" if delete else "Behalten", emoji="🗑️" if delete else "👍",
+            style=discord.ButtonStyle.danger if delete else discord.ButtonStyle.secondary,
+            custom_id=f"watched:{action}:{question_id}"))
+        self.question_id, self.action = question_id, action
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match[str]):
+        return cls(int(match["id"]), match["action"])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await handle_watched(interaction, self.question_id, self.action)
+
+
+def watched_view(question_id: int) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(WatchedButton(question_id, "del"))
+    view.add_item(WatchedButton(question_id, "keep"))
+    return view
+
+
+async def handle_watched(interaction: discord.Interaction, question_id: int, action: str) -> None:
+    bot: SeerrBot = interaction.client  # type: ignore[assignment]
+    if not bot.is_admin(interaction):
+        await interaction.response.send_message(NO_FRIEND_ADMIN, ephemeral=True)
+        return
+    question = bot.store.watch_questions.get(question_id)
+    if question is None or question.state != "open":
+        await interaction.response.edit_message(view=None)
+        return
+    await interaction.response.defer()
+    async with bot._watch_lock:
+        if question.state != "open":
+            return
+        who = interaction.user.display_name
+        if action == "keep":
+            question.state, question.answer = "kept", f"👍 Behalten ({escape(who)})."
+        else:
+            try:
+                result = await bot.delete_watched(question)
+            except (SeerrError, ArrError, JellyfinError) as error:
+                await report_error(interaction, error)
+                return
+            question.state, question.answer = "deleted", f"{result} ({escape(who)})"
+        bot.store.save()
+    text = f"{question.text}\n\n{question.answer}"[:2000]
+    await interaction.edit_original_response(content=text, view=None)
+    for channel_id, message_id in question.messages:  # the other admins' copies
+        if interaction.message is not None and message_id == interaction.message.id:
+            continue
+        try:
+            channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+            await channel.get_partial_message(message_id).edit(content=text, view=None)  # type: ignore[union-attr]
+        except discord.HTTPException:
+            pass
+
+
 STATUS_COOLDOWN = 10  # seconds between two refreshes of the same message
 STATUS_CARDS = 9  # one card per title; Discord allows 10 embeds per message, one is the summary
 
@@ -1152,35 +1348,11 @@ class DeleteButton(discord.ui.Button):
             return
         await interaction.response.defer()
         bot, title = picker.bot, picker.current
-        arr = bot.arrs.get(title.kind)
-        if arr is not None and not await asyncio.to_thread(arr.manages, title.tmdb_id):
-            # The files were there before Sonarr/Radarr: Seerr would say "deleted" and leave them on the disk.
-            folder = None
-            if bot.jellyfin is not None:
-                try:
-                    folder = await asyncio.to_thread(bot.jellyfin.folder_name, title.kind, title.tmdb_id)
-                except JellyfinError:
-                    pass
-            picker.stop()
-            embed = title_embed(bot, title, footer=f"Nicht gelöscht · {interaction.user.display_name}")
-            embed.set_field_at(0, name="Status", value=unmanaged_text(title, arr.name, folder), inline=False)
-            await interaction.edit_original_response(embed=embed, view=None)
-            return
-        torrents: list[dict] = []
-        if bot.torrents is not None:
-            # Before deleting: Sonarr/Radarr forget the downloads with the title. If that or qBittorrent fails,
-            # nothing is deleted, so it never ends up half done.
-            torrents = await asyncio.to_thread(bot.torrents.prepare, title.kind, title.tmdb_id)
-        await asyncio.to_thread(bot.seerr.delete, title)
+        deleted, text = await bot.delete_title(title)
         picker.stop()
-        removed, problem = None, None
-        if bot.torrents is not None:
-            try:
-                removed = await asyncio.to_thread(bot.torrents.remove, torrents)
-            except TorrentError as error:
-                problem = str(error)
-        embed = title_embed(bot, title, footer=f"Gelöscht von {interaction.user.display_name}")
-        embed.set_field_at(0, name="Status", value=deleted_text(title, removed, problem), inline=False)
+        who = interaction.user.display_name
+        embed = title_embed(bot, title, footer=f"Gelöscht von {who}" if deleted else f"Nicht gelöscht · {who}")
+        embed.set_field_at(0, name="Status", value=text, inline=False)
         await interaction.edit_original_response(embed=embed, view=None)
 
 

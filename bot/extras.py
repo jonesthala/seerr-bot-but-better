@@ -6,6 +6,7 @@
 - /folgen: single episodes instead of whole seasons ("S23E18-E25", "1155-1170"), straight in Sonarr.
 - /zufall: a movie or show from the library that wasn't watched yet.
 - /filmabend: a Discord event for watching together with Jellyfin's SyncPlay.
+- After watching: ask the admins whether to delete a movie or the watched episodes.
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
 from .core import GB, parse_time, shorten, size_text
+from .store import WatchQuestion
 
 # --- download brake ------------------------------------------------------------------------
 # qBittorrent states in which a torrent writes to the disk. Paused ones are left alone, also on release.
@@ -306,3 +308,76 @@ def event_end(start: datetime, ticks: object) -> datetime:
     """Discord needs an end for events outside a voice channel: running time plus a quarter hour, at least 2 hours."""
     minutes = round(ticks / 600_000_000) if isinstance(ticks, int) and ticks > 0 else 0
     return start + timedelta(minutes=max(minutes + 15, 120))
+
+
+# --- after watching: "Geschaut, löschen?" ----------------------------------------------------------
+def _size(item: dict) -> int:
+    sources = item.get("MediaSources") if isinstance(item.get("MediaSources"), list) else []
+    return sum(s.get("Size") or 0 for s in sources[:1] if isinstance(s, dict) and isinstance(s.get("Size"), int))
+
+
+def watched_questions(played: dict[str, tuple[str, list[dict]]], since: datetime, asked: set[str],
+                      series_tmdb: dict[str, int | None]) -> list[WatchQuestion]:
+    """What was watched to the end after since and not asked about yet: one question per movie, and one per show
+    for all its episodes. played: Jellyfin user id → (user name, recently played items)."""
+    groups: dict[str, WatchQuestion] = {}
+    for _, (user_name, items) in played.items():
+        for item in items:
+            data = item.get("UserData") if isinstance(item.get("UserData"), dict) else {}
+            when = parse_time(data.get("LastPlayedDate"))
+            item_id = str(item.get("Id") or "")
+            if not data.get("Played") or when is None or when <= since or not item_id or item_id in asked:
+                continue
+            if item.get("Type") == "Movie":
+                tmdb = str((item.get("ProviderIds") or {}).get("Tmdb") or "")
+                question = groups.setdefault(f"movie:{item_id}", WatchQuestion(
+                    "movie", int(tmdb) if tmdb.isdigit() else None, item_label(item)))
+            elif item.get("Type") == "Episode" and item.get("SeriesId"):
+                series_id = str(item["SeriesId"])
+                question = groups.setdefault(f"tv:{series_id}", WatchQuestion(
+                    "tv", series_tmdb.get(series_id), str(item.get("SeriesName") or "?"), series_id))
+                key = [item.get("ParentIndexNumber"), item.get("IndexNumber")]
+                if all(isinstance(n, int) for n in key) and key not in question.episodes:
+                    question.episodes.append(key)
+            else:
+                continue
+            if item_id not in question.item_ids:
+                question.item_ids.append(item_id)
+                question.size += _size(item)
+            if user_name not in question.viewers:
+                question.viewers.append(user_name)
+    for question in groups.values():
+        question.episodes.sort()
+    return list(groups.values())
+
+
+def watched_text(question: WatchQuestion, others: list[str]) -> str:
+    """The question; names already escaped for Discord."""
+    what = f"**{question.label}**"
+    if question.kind == "tv" and question.episodes:
+        what += " · " + episodes_text([{"seasonNumber": s, "episodeNumber": e} for s, e in question.episodes])
+    lines = [f"👀 **Geschaut:** {what}" + (f" · {size_text(question.size)}" if question.size else ""),
+             f"Von: {', '.join(question.viewers)}"]
+    if others:
+        lines.append(f"👥 Noch nicht fertig geschaut von: {', '.join(others)}")
+    if question.kind == "tv":
+        lines.append("Löschen, damit Platz frei wird? Sonarr holt diese Folgen danach nicht wieder.")
+    else:
+        lines.append("Löschen, damit Platz frei wird? Mit `/film` kann man ihn später wieder anfragen.")
+    return "\n".join(lines)
+
+
+def episodes_deleted_text(count: int, freed: int, removed: tuple[int, int, int] | None, problem: str | None) -> str:
+    """After deleting watched episodes. removed: (torrents removed, their size, torrents still busy) or None."""
+    what = "1 Folge" if count == 1 else f"{count} Folgen"
+    text = f"🗑️ {what} gelöscht" + (f" (≈ {size_text(freed)})" if freed else "") + ", Sonarr holt sie nicht wieder."
+    if problem:
+        return text + f" ⚠️ Die Torrents sind noch in qBittorrent: {problem}"
+    if removed is None:
+        return text + " Der Platz wird erst frei, wenn auch der Torrent in qBittorrent weg ist."
+    taken, _, busy = removed
+    if taken:
+        text += " 1 Torrent entfernt." if taken == 1 else f" {taken} Torrents entfernt."
+    if busy:
+        text += " Ein Torrent lädt noch oder wird gerade übernommen, sein Platz wird später frei."
+    return text

@@ -246,6 +246,22 @@ class JellyfinClient:
             played |= {str(i["Id"]) for i in found or [] if isinstance(i, dict) and i.get("Id")}
         return played
 
+    def recently_played(self, user_id: str, limit: int = 50) -> list[dict]:
+        """Movies and episodes this user watched to the end, last watched first (with UserData and sizes)."""
+        data = self._call("GET", "/Items", {"userId": user_id, "Recursive": "true", "IncludeItemTypes": "Episode,Movie",
+                                           "IsPlayed": "true", "SortBy": "DatePlayed", "SortOrder": "Descending",
+                                           "Limit": str(limit), "Fields": "ProviderIds,MediaSources"})
+        found = data.get("Items") if isinstance(data, dict) else None
+        return [i for i in found or [] if isinstance(i, dict) and i.get("Id")]
+
+    def user_data(self, user_id: str, item_ids: list[str]) -> dict[str, dict]:
+        """Item id → UserData (played, percentage) of these items for one user."""
+        if not item_ids:
+            return {}
+        data = self._call("GET", "/Items", {"userId": user_id, "Ids": ",".join(item_ids)})
+        found = data.get("Items") if isinstance(data, dict) else None
+        return {str(i["Id"]): i.get("UserData") or {} for i in found or [] if isinstance(i, dict) and i.get("Id")}
+
     def folder_name(self, kind: str, tmdb_id: int) -> str | None:
         """The folder of a movie or show in the library, e.g. 'Call Me by Your Name (2017)' (for /löschen)."""
         data = self._call("GET", "/Items", {"Recursive": "true", "Fields": "ProviderIds,Path",

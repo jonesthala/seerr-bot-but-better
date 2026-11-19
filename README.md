@@ -64,6 +64,12 @@ to Radarr or Sonarr as usual.
 - **Download brake** (with qBittorrent, setup step 5): below `BRAKE_FREE_GB` free, the bot pauses the running
   downloads in qBittorrent and says so in the channel; once there is 2 GB more again, it starts exactly those
   again. Requests are refused earlier, but downloads that already run would otherwise fill the disk.
+- **"Geschaut, löschen?"** (needs the Jellyfin setup and admins): every few minutes the bot looks which movies
+  and episodes someone watched to the end in Jellyfin and asks the admins by DM, with *Löschen* / *Behalten*
+  buttons, who watched it and who of the others hasn't finished it yet. Episodes of one show come as one
+  question. *Löschen* deletes a movie like `/löschen`; for episodes it deletes just their files in Sonarr, stops
+  monitoring them (so they aren't fetched again) and removes their finished torrents. Only what is watched after
+  the bot starts counts. `WATCHED_ASK=0` turns it off.
 - **`/folgen <serie> <folgen>`** (admins only, needs Sonarr): single episodes instead of whole seasons, e.g.
   `S23E18-E25`, `S23` or, for anime, `1155-1170`. Shows what is there, what is missing and how much space it
   needs; *Holen* monitors exactly these episodes in Sonarr and searches them.
@@ -210,6 +216,7 @@ python -m bot    # remembers its state in ./data unless DATA_DIR says otherwise
 | `DISCORD_APPROVAL_CHANNEL_ID` | the bot's channel | Where requests waiting for approval are posted with buttons |
 | `MIN_FREE_GB` | `15` | Refuse new requests and warn below this much free space |
 | `BRAKE_FREE_GB` | `3` | Pause running downloads in qBittorrent below this much free space; `0` = off |
+| `WATCHED_ASK` | `1` | Ask the admins by DM whether to delete what was watched to the end in Jellyfin; `0` = off |
 | `REQUEST_LIMIT`, `REQUEST_LIMIT_DAYS` | `0`, `7` | At most this many requests per person in this many days; `0` = no limit. Admins have none |
 | `MOVIE_PROFILES`, `TV_PROFILES` | empty | Radarr/Sonarr quality profiles to choose from, by name, e.g. `HD-1080p,Ultra-HD`; the first is preselected |
 | `WEEKLY_DIGEST` | empty | Post what's new every week, e.g. `sun 18:00` or `so 18:00`; empty = off |
