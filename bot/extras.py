@@ -383,6 +383,23 @@ def episodes_deleted_text(count: int, freed: int, removed: tuple[int, int, int] 
     return text
 
 
+# --- early search ---------------------------------------------------------------------------------------
+def early_search_ids(episodes: list[dict], loading: set[int], now: datetime, ahead_days: int,
+                     back_days: int = 2) -> list[int]:
+    """Monitored episodes without a file that come out within ahead_days or came out in the last back_days and aren't
+    downloading. Streaming services often publish before the TV date TVDB has (Dexter: Friday, TVDB: Monday), and
+    Sonarr's RSS check can miss a release, so these are searched directly."""
+    ids = []
+    for e in episodes:
+        when = parse_time(e.get("airDateUtc"))
+        if (when is None or not isinstance(e.get("id"), int) or e.get("hasFile") or not e.get("monitored", True)
+                or e["id"] in loading or (e.get("seasonNumber") or 0) <= 0):
+            continue
+        if now - timedelta(days=back_days) <= when <= now + timedelta(days=ahead_days):
+            ids.append(e["id"])
+    return sorted(ids)
+
+
 # --- /verfolgen and /kalender ---------------------------------------------------------------------------
 WEEKDAYS_SHORT = ("Mo", "Di", "Mi", "Do", "Fr", "Sa", "So")
 

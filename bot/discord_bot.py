@@ -76,6 +76,7 @@ from .extras import (
     event_end,
     episodes_deleted_text,
     calendar_lines,
+    early_search_ids,
     follow_lines,
     item_label,
     parse_start,
@@ -108,6 +109,7 @@ RATE_CACHE_SECONDS = 3600  # GB per hour measured in the library, for the size e
 AUTOCOMPLETE_SECONDS = 2.5  # Discord gives up after 3 s
 MAX_CHECKS_PER_RUN = 30
 BRAKE_MINUTES = 1  # the download brake looks this often at the free space
+EARLY_SEARCH_MINUTES = 60  # how often episodes that come out soon are searched
 LIBRARY_CACHE_SECONDS = 600  # movies, shows and genres for /zufall and /filmabend
 WATCHED_MINUTES = 5  # how often Jellyfin is asked what was watched
 RESYNC_SECONDS = 180  # after deleting: Seerr compares itself with Jellyfin this long after the last deletion
@@ -244,6 +246,8 @@ class SeerrBot(discord.Client):
         self.watch_loop.start()
         if self.qbit is not None and self.settings.brake_free_gb > 0:
             self.brake_loop.start()
+        if "tv" in self.arrs and self.settings.early_search_days > 0:
+            self.early_search_loop.start()
         if self.jellyfin is not None and self.settings.watched_ask and self.settings.has_admins:
             self.watched_loop.start()
         if self.settings.weekly_digest:
@@ -360,6 +364,24 @@ class SeerrBot(discord.Client):
         except Exception:  # noqa: BLE001 - the loop must keep running
             log.exception("Abo check failed")
 
+    @tasks.loop(minutes=EARLY_SEARCH_MINUTES)
+    async def early_search_loop(self) -> None:
+        try:
+            await self.early_search()
+        except Exception:  # noqa: BLE001 - the loop must keep running
+            log.exception("Early search failed")
+
+    async def early_search(self) -> None:
+        """Searches monitored episodes that come out in the next days or just came out and are still missing."""
+        sonarr = self.arrs["tv"]
+        now = datetime.now(timezone.utc)
+        days = self.settings.early_search_days
+        episodes = await asyncio.to_thread(sonarr.calendar, now - timedelta(days=2), now + timedelta(days=days))
+        ids = early_search_ids(episodes, await asyncio.to_thread(sonarr.queued_ids), now, days)
+        if ids:
+            await asyncio.to_thread(sonarr.search_episodes, ids)
+            log.info("Early search for %d episodes", len(ids))
+
     @tasks.loop(minutes=BRAKE_MINUTES)
     async def brake_loop(self) -> None:
         try:
@@ -379,6 +401,7 @@ class SeerrBot(discord.Client):
     @digest_loop.before_loop
     @abo_loop.before_loop
     @brake_loop.before_loop
+    @early_search_loop.before_loop
     @watched_loop.before_loop
     async def _wait_until_ready(self) -> None:
         await self.wait_until_ready()

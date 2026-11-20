@@ -103,6 +103,7 @@ class Settings:
     seerr_public_url: str
     min_free_gb: int = 15
     brake_free_gb: int = 3  # below this, running downloads are paused (0 = never)
+    early_search_days: int = 4  # search monitored episodes this many days before their TV date (0 = off)
     watched_ask: bool = True  # after watching: ask the admins whether to delete it
     approval_channel_id: int | None = None
     data_dir: str = "data"
@@ -211,6 +212,7 @@ class Settings:
             seerr_public_url=public,
             min_free_gb=_int("MIN_FREE_GB", 15),
             brake_free_gb=brake,
+            early_search_days=max(_int("EARLY_SEARCH_DAYS", 4), 0),
             watched_ask=_text("WATCHED_ASK", "1").lower() not in ("0", "false", "no", "nein", "off", "aus"),
             approval_channel_id=_int("DISCORD_APPROVAL_CHANNEL_ID", 0) or None,
             data_dir=_text("DATA_DIR") or "data",

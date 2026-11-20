@@ -292,6 +292,11 @@ class ArrClient:
         records = data.get("records") if isinstance(data, dict) else None
         return {r[key] for r in records or [] if isinstance(r, dict) and isinstance(r.get(key), int)}
 
+    def search_episodes(self, episode_ids: list[int]) -> None:
+        """Sonarr searches these episodes now on all indexers and takes the best release."""
+        if episode_ids:
+            self._request("POST", "/command", body={"name": "EpisodeSearch", "episodeIds": episode_ids})
+
     def queued_titles(self) -> dict[int, str]:
         """TMDB id → 'Name (Jahr)' of everything in the download queue (for /status, also without a request)."""
         key = "series" if self.kind == "tv" else "movie"

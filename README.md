@@ -82,6 +82,10 @@ disk from running full.
 - **Download brake** (with qBittorrent, setup step 5): below `BRAKE_FREE_GB` free, the bot pauses the running
   downloads in qBittorrent and says so in the channel; once there is 2 GB more again, it starts exactly those
   again. Requests are refused earlier, but downloads that already run would otherwise fill the disk.
+- **Early search** (needs Sonarr): every hour the bot has Sonarr search monitored episodes that come out within
+  `EARLY_SEARCH_DAYS` (default 4) or came out in the last two days and are still missing. Streaming services often
+  publish days before the TV date TheTVDB has (e.g. Friday instead of Monday), and Sonarr's RSS check alone can miss
+  a release on busy indexers.
 - **"Geschaut, löschen?"** (needs the Jellyfin setup and admins): every few minutes the bot looks which movies
   and episodes someone watched to the end in Jellyfin and asks the admins by DM, with *Löschen* / *Behalten*
   buttons, who watched it and who of the others hasn't finished it yet. Episodes of one show come as one
@@ -250,6 +254,7 @@ python -m bot    # remembers its state in ./data unless DATA_DIR says otherwise
 | `DISCORD_APPROVAL_CHANNEL_ID` | the bot's channel | Where requests waiting for approval are posted with buttons |
 | `MIN_FREE_GB` | `15` | Refuse new requests and warn below this much free space |
 | `BRAKE_FREE_GB` | `3` | Pause running downloads in qBittorrent below this much free space; `0` = off |
+| `EARLY_SEARCH_DAYS` | `4` | Search monitored episodes this many days before their TV date (hourly); `0` = off |
 | `WATCHED_ASK` | `1` | Ask the admins by DM whether to delete what was watched to the end in Jellyfin; `0` = off |
 | `REQUEST_LIMIT`, `REQUEST_LIMIT_DAYS` | `0`, `7` | At most this many requests per person in this many days; `0` = no limit. Admins have none |
 | `MOVIE_PROFILES`, `TV_PROFILES` | empty | Radarr/Sonarr quality profiles to choose from, by name, e.g. `HD-1080p,Ultra-HD`; the first is preselected |

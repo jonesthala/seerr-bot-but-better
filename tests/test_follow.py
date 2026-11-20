@@ -6,7 +6,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from bot.arr import ArrClient
 from bot.core import help_text
-from bot.extras import calendar_lines, follow_lines, parse_start, start_episode, when_text
+from bot.extras import calendar_lines, early_search_ids, follow_lines, parse_start, start_episode, when_text
 from bot.store import Follow, Store
 from test_seerr import FakeSeerr, client
 
@@ -160,6 +160,32 @@ class FollowTextTest(unittest.TestCase):
             "**Mo 23.11.**", "`02:00` 📺 Dexter: Resurrection · S02E04 · ⬇️ lädt",
         ])
         self.assertEqual(calendar_lines([], [], set(), set(), start, end, NOW, ZURICH), [])
+
+
+class EarlySearchTest(unittest.TestCase):
+    def test_streaming_before_the_tv_date(self):
+        friday = datetime(2026, 11, 20, 10, 0, tzinfo=timezone.utc)
+        episodes = [
+            ep(13, 2, 4, "2026-11-23T01:00:00Z", monitored=True),  # TVDB Monday, out on Friday: searched
+            ep(14, 2, 5, "2026-11-30T01:00:00Z", monitored=True),  # too far ahead
+            ep(15, 2, 3, "2026-11-16T01:00:00Z", monitored=True),  # out 4 days ago: RSS had its chance
+            ep(16, 2, 6, "2026-11-21T01:00:00Z", has_file=True, monitored=True),  # already there
+            ep(17, 2, 7, "2026-11-22T01:00:00Z", monitored=False),  # not wanted
+            ep(18, 2, 8, "2026-11-19T20:00:00Z", monitored=True),  # yesterday, still missing
+            ep(19, 2, 9, "2026-11-21T01:00:00Z", monitored=True),  # downloading
+            ep(20, 0, 1, "2026-11-21T01:00:00Z", monitored=True),  # special
+        ]
+        self.assertEqual(early_search_ids(episodes, {19}, friday, ahead_days=4), [13, 18])
+        self.assertEqual(early_search_ids(episodes, set(), friday, ahead_days=0), [18])  # only what is already out
+
+
+class SonarrSearchTest(unittest.TestCase):
+    def test_search(self):
+        fake = FakeSonarr()
+        sonarr = ArrClient("http://s", "k", "tv", fetch=fake)
+        sonarr.search_episodes([13])
+        sonarr.search_episodes([])
+        self.assertEqual([c[2] for c in fake.sent("POST", "/command")], [{"name": "EpisodeSearch", "episodeIds": [13]}])
 
 
 class FollowStoreTest(unittest.TestCase):
