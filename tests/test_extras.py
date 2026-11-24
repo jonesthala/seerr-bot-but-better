@@ -283,7 +283,7 @@ class SettingsAndHelpTest(unittest.TestCase):
         self.assertIn("`/zufall Filme Comedy`", friend)
         self.assertIn("`/filmabend Dune morgen 20:00`", friend)
         self.assertNotIn("/folgen", friend)
-        self.assertIn("`/folgen One Piece S23E18-E25`", help_text(commands, admin=True, may_request=True))
+        self.assertIn("`/folgen Dexter`", help_text(commands, admin=True, may_request=True))
 
 
 if __name__ == "__main__":

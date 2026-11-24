@@ -6,7 +6,9 @@ from urllib.parse import parse_qs, urlsplit
 
 from bot.arr import ArrClient
 from bot.core import help_text
-from bot.extras import calendar_lines, early_search_ids, follow_lines, parse_start, start_episode, when_text
+from bot.extras import (calendar_lines, early_search_ids, episode_label, episode_state, first_season_to_pick,
+                         follow_lines, parse_start, picker_lines, season_episodes, season_numbers, start_episode,
+                         when_text)
 from bot.store import Follow, Store
 from test_seerr import FakeSeerr, client
 
@@ -186,6 +188,46 @@ class SonarrSearchTest(unittest.TestCase):
         sonarr.search_episodes([13])
         sonarr.search_episodes([])
         self.assertEqual([c[2] for c in fake.sent("POST", "/command")], [{"name": "EpisodeSearch", "episodeIds": [13]}])
+
+
+class PickerTest(unittest.TestCase):
+    EPS = [ep(1, 0, 1, "2026-02-17T01:00:00Z"), ep(2, 1, 2, "2025-07-20T01:00:00Z", has_file=True),
+           ep(3, 1, 1, "2025-07-13T01:00:00Z", has_file=True),
+           {**ep(13, 2, 4, "2026-11-23T01:00:00Z", monitored=True), "title": "Young Blood"},
+           {**ep(12, 2, 3, "2026-11-16T01:00:00Z"), "title": "TBA"},
+           {**ep(14, 2, 5, "2026-11-30T01:00:00Z"), "title": "Blood Brothers", "absoluteEpisodeNumber": 15}]
+
+    def test_seasons(self):
+        self.assertEqual(season_numbers(self.EPS), [1, 2, 0])  # specials last
+        self.assertEqual([e["episodeNumber"] for e in season_episodes(self.EPS, 2)], [3, 4, 5])
+        self.assertEqual(first_season_to_pick(self.EPS), 2)  # season 1 is complete
+        self.assertEqual(first_season_to_pick(self.EPS[1:3]), 1)  # all there: the latest
+
+    def test_labels_and_states(self):
+        young, tba, later = self.EPS[3], self.EPS[4], self.EPS[5]
+        self.assertEqual(episode_label(young, anime=False), "E04 · Young Blood")
+        self.assertEqual(episode_label(tba, anime=False), "E03")
+        self.assertEqual(episode_label(later, anime=True), "E05 · Folge 15 · Blood Brothers")
+        self.assertEqual(episode_state(young, set(), NOW, ZURICH), "📅 erscheint 23.11.2026")
+        self.assertEqual(episode_state(tba, set(), NOW, ZURICH), "🔎 erschienen 16.11.2026")
+        self.assertEqual(episode_state(young, {13}, NOW, ZURICH), "⬇️ lädt gerade")
+        self.assertEqual(episode_state(self.EPS[1], set(), NOW, ZURICH), "✅ schon da")
+
+    def test_lines(self):
+        lines = picker_lines(season_episodes(self.EPS, 2), {13}, set(), NOW, ZURICH, anime=False)
+        self.assertEqual(lines, ["⬜ E03", "☑️ E04 · Young Blood", "📅 E05 · Blood Brothers"])
+
+
+class SonarrPickTest(unittest.TestCase):
+    def test_monitor_and_remove(self):
+        fake = FakeSonarr()
+        sonarr = ArrClient("http://s", "k", "tv", fetch=fake)
+        sonarr.set_monitored([1, 2], False)
+        sonarr.set_monitored([], True)  # nothing to do
+        sonarr.remove_series(10)
+        self.assertEqual(fake.sent("PUT", "/episode/monitor")[0][2], {"episodeIds": [1, 2], "monitored": False})
+        delete = fake.sent("DELETE", "/series/10")[0]
+        self.assertEqual(delete[3], {"deleteFiles": ["false"], "addImportListExclusion": ["false"]})
 
 
 class FollowStoreTest(unittest.TestCase):

@@ -77,6 +77,9 @@ from .extras import (
     episodes_deleted_text,
     calendar_lines,
     early_search_ids,
+    episode_label,
+    episode_state,
+    first_season_to_pick,
     follow_lines,
     item_label,
     parse_start,
@@ -84,11 +87,15 @@ from .extras import (
     when_text,
     parse_episodes,
     parse_when,
+    PICKER_PAGE,
     per_episode_estimate,
+    picker_lines,
     pick_candidates,
     pick_facts,
     plan_episodes,
     plan_lines,
+    season_episodes,
+    season_numbers,
     select_episodes,
     watched_questions,
     watched_text,
@@ -676,28 +683,35 @@ class SeerrBot(discord.Client):
             sent.append([message.channel.id, message.id])
         return sent
 
+    async def ensure_in_sonarr(self, tmdb_id: int, new_seasons: bool = False) -> tuple[dict | None, list[dict], bool, str]:
+        """The show in Sonarr with its episodes; adds it first if needed, without monitoring or searching anything
+        (what Sonarr monitors by itself when adding is unmonitored again). (show, episodes, added now, problem)"""
+        sonarr = self.arrs["tv"]
+        series = next((s for s in await asyncio.to_thread(sonarr.series) if s.get("tmdbId") == tmdb_id), None)
+        if series is not None:
+            return series, await asyncio.to_thread(sonarr.episodes, series["id"]), False, ""
+        tvdb, anime, _ = await asyncio.to_thread(self.seerr.show_ids, tmdb_id)
+        defaults = await asyncio.to_thread(self.seerr.sonarr_defaults)
+        lookup = await asyncio.to_thread(sonarr.lookup_tvdb, tvdb) if tvdb else None
+        if lookup is None or defaults is None:
+            return None, [], False, ("⚠️ Sonarr findet diese Serie nicht (TMDB kennt keine TVDB-Nummer), oder in Seerr ist "
+                                     "kein Sonarr eingerichtet.")
+        profile, folder, anime_profile, anime_folder = defaults
+        series = await asyncio.to_thread(sonarr.add_series, lookup, anime_profile if anime else profile,
+                                         anime_folder if anime else folder, anime, new_seasons)
+        episodes = await asyncio.to_thread(sonarr.wait_for_episodes, series["id"])
+        await asyncio.to_thread(sonarr.set_monitored, [e["id"] for e in episodes if e.get("monitored")], False)
+        episodes = [{**e, "monitored": False} for e in episodes]
+        problem = "" if episodes else "⚠️ Sonarr hat die Folgen noch nicht geladen. Versuch es in einer Minute nochmals."
+        return series, episodes, True, problem
+
     async def run_follow(self, follow: Follow) -> tuple[bool, str]:
         """/verfolgen: adds the show to Sonarr if needed (without its old episodes) and follows it. (done, text)"""
         sonarr = self.arrs["tv"]
         now = datetime.now(timezone.utc)
-        series = next((s for s in await asyncio.to_thread(sonarr.series) if s.get("tmdbId") == follow.tmdb_id), None)
-        added = False
-        if series is None:
-            tvdb, anime, _ = await asyncio.to_thread(self.seerr.show_ids, follow.tmdb_id)
-            defaults = await asyncio.to_thread(self.seerr.sonarr_defaults)
-            lookup = await asyncio.to_thread(sonarr.lookup_tvdb, tvdb) if tvdb else None
-            if lookup is None or defaults is None:
-                return False, ("⚠️ Sonarr findet diese Serie nicht (TMDB kennt keine TVDB-Nummer), oder in Seerr ist kein "
-                               "Sonarr eingerichtet.")
-            profile, folder, anime_profile, anime_folder = defaults
-            series = await asyncio.to_thread(sonarr.add_series, lookup, anime_profile if anime else profile,
-                                             anime_folder if anime else folder, anime, follow.new_seasons)
-            added = True
-            episodes = await asyncio.to_thread(sonarr.wait_for_episodes, series["id"])
-        else:
-            episodes = await asyncio.to_thread(sonarr.episodes, series["id"])
-        if not episodes:
-            return False, "⚠️ Sonarr hat die Folgen noch nicht geladen. Versuch es in einer Minute nochmals."
+        series, episodes, added, problem = await self.ensure_in_sonarr(follow.tmdb_id, follow.new_seasons)
+        if series is None or not episodes:
+            return False, problem
         try:
             start = start_episode(parse_start(follow.start_text), episodes)
         except ValueError as error:
@@ -1595,9 +1609,11 @@ def fetch_image(url: str) -> bytes | None:
 class EpisodeConfirm(discord.ui.View):
     """/folgen: what would be fetched, and the button that tells Sonarr."""
 
-    def __init__(self, bot: SeerrBot, owner: discord.abc.User, show: dict, plan: EpisodePlan, free: int | None) -> None:
+    def __init__(self, bot: SeerrBot, owner: discord.abc.User, show: dict, plan: EpisodePlan, free: int | None,
+                 added: bool = False) -> None:
         super().__init__(timeout=PICK_TIMEOUT)
         self.bot, self.owner, self.show, self.plan, self.free = bot, owner, show, plan, free
+        self.added = added  # the bot just added the show to Sonarr: take it out again if nothing is fetched
         self.message: discord.Message | None = None
 
     @property
@@ -1628,6 +1644,7 @@ class EpisodeConfirm(discord.ui.View):
         await report_error(interaction, error)
 
     async def on_timeout(self) -> None:
+        await drop_added_show(self.bot, self.show, self.added)
         if self.message is not None:
             try:
                 await self.message.edit(view=None)
@@ -1658,6 +1675,190 @@ class EpisodeConfirm(discord.ui.View):
         self.stop()
         await interaction.response.edit_message(embed=self.embed("❌ Abgebrochen, nichts geholt.", discord.Color.light_grey()),
                                                 view=None)
+        await drop_added_show(self.bot, self.show, self.added)
+
+
+async def drop_added_show(bot: SeerrBot, show: dict, added: bool) -> None:
+    """A show the bot added to Sonarr only to show its episodes goes again when nothing was fetched."""
+    if added:
+        try:
+            await asyncio.to_thread(bot.arrs["tv"].remove_series, show["id"])
+        except ArrError:
+            log.warning("Could not remove %s from Sonarr again", show.get("title"))
+
+
+class EpisodePicker(discord.ui.View):
+    """/folgen without episodes: pick a season, then click episodes (with titles) or take the whole season."""
+
+    def __init__(self, bot: SeerrBot, owner: discord.abc.User, show: dict, episodes: list[dict], loading: set[int],
+                 free: int | None, per_episode: int, added: bool) -> None:
+        super().__init__(timeout=900)
+        self.bot, self.owner, self.show, self.episodes = bot, owner, show, episodes
+        self.loading, self.free, self.per_episode, self.added = loading, free, per_episode, added
+        self.anime = show.get("seriesType") == "anime"
+        self.seasons = season_numbers(episodes)
+        self.season = first_season_to_pick(episodes)
+        self.page = 0
+        self.selected: set[int] = set()
+        self.done = False
+        self.message: discord.Message | None = None
+        self.render()
+
+    @property
+    def label(self) -> str:
+        year = self.show.get("year")
+        return f"{self.show.get('title', '?')} ({year})" if year else str(self.show.get("title", "?"))
+
+    def choosable(self) -> list[dict]:
+        return [e for e in season_episodes(self.episodes, self.season) if not e.get("hasFile") and e["id"] not in self.loading]
+
+    def pages(self) -> int:
+        return max(1, -(-len(self.choosable()) // PICKER_PAGE))
+
+    def render(self) -> None:
+        self.clear_items()
+        now = datetime.now(timezone.utc)
+        seasons = self.seasons[-25:]
+        options = []
+        for number in seasons:
+            eps = season_episodes(self.episodes, number)
+            have = sum(1 for e in eps if e.get("hasFile"))
+            options.append(discord.SelectOption(label="Specials" if number == 0 else f"Staffel {number}", value=str(number),
+                                                description=f"{len(eps)} Folgen, {have} schon da", default=number == self.season))
+        season_menu = discord.ui.Select(placeholder="Staffel wählen", options=options, row=0)
+        season_menu.callback = self.on_season
+        self.add_item(season_menu)
+        page = self.choosable()[self.page * PICKER_PAGE:(self.page + 1) * PICKER_PAGE]
+        for row, start in enumerate(range(0, len(page), 25), start=1):
+            chunk = page[start:start + 25]
+            menu = discord.ui.Select(
+                placeholder=f"Folgen anklicken: E{chunk[0].get('episodeNumber', 0):02d}–E{chunk[-1].get('episodeNumber', 0):02d}",
+                min_values=0, max_values=len(chunk), row=row,
+                options=[discord.SelectOption(label=episode_label(e, self.anime), value=str(e["id"]),
+                                              description=shorten(episode_state(e, self.loading, now, self.bot.settings.zone), 100),
+                                              default=e["id"] in self.selected) for e in chunk])
+            menu.callback = self.chunk_callback([e["id"] for e in chunk])
+            self.add_item(menu)
+        whole = discord.ui.Button(label="Ganze Staffel", emoji="📦", style=discord.ButtonStyle.secondary, row=4,
+                                  disabled=not self.choosable())
+        whole.callback = self.on_whole
+        self.add_item(whole)
+        if self.pages() > 1:
+            back = discord.ui.Button(emoji="◀️", style=discord.ButtonStyle.secondary, row=4, disabled=self.page == 0)
+            forward = discord.ui.Button(emoji="▶️", style=discord.ButtonStyle.secondary, row=4,
+                                        disabled=self.page >= self.pages() - 1)
+            back.callback, forward.callback = self.on_back, self.on_forward
+            self.add_item(back)
+            self.add_item(forward)
+        else:
+            clear = discord.ui.Button(label="Auswahl leeren", style=discord.ButtonStyle.secondary, row=4,
+                                      disabled=not self.selected)
+            clear.callback = self.on_clear
+            self.add_item(clear)
+        fetch = discord.ui.Button(label=f"Holen ({len(self.selected)})", emoji="⬇️", style=discord.ButtonStyle.success,
+                                  row=4, disabled=not self.selected)
+        fetch.callback = self.on_fetch
+        self.add_item(fetch)
+        cancel = discord.ui.Button(label="Abbrechen", style=discord.ButtonStyle.secondary, row=4)
+        cancel.callback = self.on_cancel
+        self.add_item(cancel)
+
+    def embed(self) -> discord.Embed:
+        now = datetime.now(timezone.utc)
+        eps = season_episodes(self.episodes, self.season)
+        shown = eps if len(eps) <= PICKER_PAGE else [e for e in eps if e in self.choosable()[
+            self.page * PICKER_PAGE:(self.page + 1) * PICKER_PAGE]]
+        lines = picker_lines(shown, self.selected, self.loading, now, self.bot.settings.zone, self.anime)
+        season = "Specials" if self.season == 0 else f"Staffel {self.season}"
+        embed = discord.Embed(title=f"📺 {self.label} · {season}", description="\n".join(lines)[:3900] or "Keine Folgen.",
+                              color=discord.Color.blurple())
+        size = len(self.selected) * self.per_episode
+        text = (f"**{len(self.selected)} {'Folge' if len(self.selected) == 1 else 'Folgen'}** ≈ {size_text(size)}"
+                if self.selected else "Noch nichts ausgewählt")
+        if self.free is not None:
+            text += f" · frei {size_text(self.free)}"
+        embed.add_field(name="Auswahl (über alle Staffeln)", value=text, inline=False)
+        poster = next((i.get("remoteUrl") for i in self.show.get("images") or []
+                       if isinstance(i, dict) and i.get("coverType") == "poster" and i.get("remoteUrl")), None)
+        if poster:
+            embed.set_thumbnail(url=poster)
+        embed.set_footer(text="✅ da · ⬇️ lädt · ☑️ ausgewählt · ⬜ fehlt · 📅 kommt noch. Folgen anklicken, dann Holen.")
+        return embed
+
+    async def refresh(self, interaction: discord.Interaction) -> None:
+        self.render()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def on_season(self, interaction: discord.Interaction) -> None:
+        self.season, self.page = int(interaction.data["values"][0]), 0  # type: ignore[index]
+        await self.refresh(interaction)
+
+    def chunk_callback(self, ids: list[int]):
+        async def callback(interaction: discord.Interaction) -> None:
+            self.selected -= set(ids)
+            self.selected |= {int(v) for v in interaction.data.get("values", [])}  # type: ignore[union-attr]
+            await self.refresh(interaction)
+        return callback
+
+    async def on_whole(self, interaction: discord.Interaction) -> None:
+        self.selected |= {e["id"] for e in self.choosable()}
+        await self.refresh(interaction)
+
+    async def on_clear(self, interaction: discord.Interaction) -> None:
+        self.selected -= {e["id"] for e in season_episodes(self.episodes, self.season)}
+        await self.refresh(interaction)
+
+    async def on_back(self, interaction: discord.Interaction) -> None:
+        self.page = max(0, self.page - 1)
+        await self.refresh(interaction)
+
+    async def on_forward(self, interaction: discord.Interaction) -> None:
+        self.page = min(self.pages() - 1, self.page + 1)
+        await self.refresh(interaction)
+
+    async def on_fetch(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        chosen = [e for e in self.episodes if e["id"] in self.selected]
+        plan = plan_episodes(chosen, datetime.now(timezone.utc), self.per_episode)
+        await asyncio.to_thread(self.bot.arrs["tv"].want_episodes, self.show, [e["id"] for e in plan.get + plan.later],
+                                [e["id"] for e in plan.get])
+        self.done = True
+        self.stop()
+        count = len(plan.get)
+        head = (f"✅ **Sonarr sucht jetzt {count} {'Folge' if count == 1 else 'Folgen'}.** Fortschritt in `/status`."
+                if count else "✅ **Vorgemerkt:** Sonarr holt die Folgen, sobald sie erscheinen.")
+        tmdb_id = self.show.get("tmdbId")
+        if isinstance(tmdb_id, int) and tmdb_id > 0:
+            note = await self.bot.auto_abo(interaction.user.id, Title("tv", tmdb_id, str(self.show.get("title") or ""),
+                                                                      str(self.show.get("year") or ""), "", None, 0))
+            if note:
+                head += f"\n{note}"
+        embed = discord.Embed(title=f"📺 {self.label}", color=discord.Color.green(),
+                              description="\n".join([head] + plan_lines(plan, self.free, self.bot.settings.min_free_gb * GB)))
+        embed.set_footer(text=f"Geholt von {interaction.user.display_name}")
+        await interaction.edit_original_response(embed=embed, view=None)
+
+    async def on_cancel(self, interaction: discord.Interaction) -> None:
+        self.stop()
+        await interaction.response.edit_message(content="❌ Abgebrochen, nichts geholt.", embed=None, view=None)
+        await drop_added_show(self.bot, self.show, self.added and not self.done)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner.id:
+            return True
+        await interaction.response.send_message(NOT_YOURS, ephemeral=True)
+        return False
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        await report_error(interaction, error)
+
+    async def on_timeout(self) -> None:
+        await drop_added_show(self.bot, self.show, self.added and not self.done)
+        if self.message is not None:
+            try:
+                await self.message.edit(view=None)
+            except discord.HTTPException:
+                pass
 
 
 class RandomPick(discord.ui.View):
@@ -2034,53 +2235,84 @@ def extra_commands(bot: SeerrBot, requester) -> list[app_commands.Command]:
             return True
         raise NotAllowed(NO_FRIEND_ADMIN)
 
-    async def suggest_sonarr(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-        try:
-            shows = await asyncio.wait_for(bot.sonarr_series(), AUTOCOMPLETE_SECONDS)
-        except Exception:  # noqa: BLE001 - no suggestions is fine, typing still works
-            return []
-        text = current.strip().casefold()
-        found = sorted((s for s in shows if text in str(s.get("title", "")).casefold()),
-                       key=lambda s: str(s.get("sortTitle") or s.get("title") or ""))
-        return [app_commands.Choice(name=shorten(f"{s.get('title', '?')} ({s.get('year')})", 100), value=str(s["id"]))
-                for s in found][:25]
+    async def suggest_follow(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        """Shows in Sonarr, and (from Seerr's search) shows that aren't there yet."""
+        text = current.strip()
 
-    @app_commands.command(name="folgen", description="Einzelne Folgen einer Serie holen statt ganzer Staffeln (nur Admins)")
-    @app_commands.describe(serie="Serie aus Sonarr", folgen="z.B. S23E18-E25, S23 oder bei Anime 1155-1170")
-    @app_commands.autocomplete(serie=suggest_sonarr)
+        async def search() -> list[Title]:
+            return await asyncio.to_thread(bot.seerr.search, text, "tv") if len(text) >= 2 else []
+        shows, found = await asyncio.gather(asyncio.wait_for(bot.sonarr_series(), AUTOCOMPLETE_SECONDS),
+                                            asyncio.wait_for(search(), AUTOCOMPLETE_SECONDS), return_exceptions=True)
+        shows = shows if isinstance(shows, list) else []
+        found = found if isinstance(found, list) else []
+        known = {s.get("tmdbId") for s in shows}
+        choices = [app_commands.Choice(name=shorten(f"{s.get('title', '?')} ({s.get('year')}) · in Sonarr", 100),
+                                       value=f"s:{s['id']}")
+                   for s in shows if text.casefold() in str(s.get("title", "")).casefold()]
+        choices += [app_commands.Choice(name=shorten(f"{t.label} · neu", 100), value=f"t:{t.tmdb_id}")
+                    for t in found if t.tmdb_id not in known]
+        return choices[:25]
+
+    async def resolve_show(text: str) -> tuple[int, str] | None:
+        """(TMDB id, name) of a picked suggestion or typed name: Sonarr first, then Seerr's search."""
+        value = text.strip()
+        shows = await bot.sonarr_series()
+        if value.startswith("s:") and value[2:].isdigit():
+            show = next((s for s in shows if s.get("id") == int(value[2:])), None)
+        else:
+            show = next((s for s in shows if str(s.get("title", "")).casefold().startswith(value.casefold())), None)
+        if show is not None and isinstance(show.get("tmdbId"), int) and show["tmdbId"] > 0:
+            year = show.get("year")
+            return show["tmdbId"], f"{show.get('title', '?')} ({year})" if year else str(show.get("title", "?"))
+        if value.startswith("t:") and value[2:].isdigit():
+            title = await asyncio.to_thread(bot.seerr.details, "tv", int(value[2:]))
+            return title.tmdb_id, title.label
+        found = await asyncio.to_thread(bot.seerr.search, value, "tv")
+        return (found[0].tmdb_id, found[0].label) if found else None
+
+    @app_commands.command(name="folgen", description="Folgen einzeln oder ganze Staffeln holen, mit Titeln zum Anklicken (nur Admins)")
+    @app_commands.describe(serie="Die Serie, auch eine, die noch nicht da ist",
+                           folgen="Leer lassen für die Auswahl zum Anklicken. Oder direkt: S23E18-E25, S23, bei Anime 1155-1170")
+    @app_commands.autocomplete(serie=suggest_follow)
     @app_commands.check(only_admin)
-    async def folgen(interaction: discord.Interaction, serie: str, folgen: str) -> None:
+    async def folgen(interaction: discord.Interaction, serie: str, folgen: Optional[str] = None) -> None:
         await interaction.response.defer(thinking=True)
-        sonarr = bot.arrs["tv"]
-        shows = await asyncio.to_thread(sonarr.series)  # fresh, the show is written back if it isn't monitored
-        wanted = serie.strip()
-        show = next((s for s in shows if str(s["id"]) == wanted), None) or next(
-            (s for s in shows if str(s.get("title", "")).casefold().startswith(wanted.casefold())), None)
-        if show is None:
-            await interaction.followup.send(f"🔎 Diese Serie ist nicht in Sonarr: **{escape(wanted)}**. "
-                                            "Zuerst mit `/serie` anfragen.")
+        found = await resolve_show(serie)
+        if found is None:
+            await interaction.followup.send(f"🔎 Keine Serie gefunden für **{escape(serie.strip())}**.")
             return
-        try:
-            chosen = select_episodes(await asyncio.to_thread(sonarr.episodes, show["id"]), parse_episodes(folgen))
-        except ValueError as error:
-            await interaction.followup.send(f"⚠️ {error}")
-            return
-        name = escape(str(show.get("title") or "?"))
-        if not chosen:
-            await interaction.followup.send(f"🔎 Diese Folgen gibt es bei **{name}** nicht: {escape(folgen.strip())}")
-            return
-        if len(chosen) > MAX_EPISODES:
-            await interaction.followup.send(f"⚠️ Das wären {len(chosen)} Folgen, mehr als {MAX_EPISODES} auf einmal geht "
-                                            "nicht. Ganze Staffeln lieber mit `/serie` anfragen.")
+        show, episodes, added, problem = await bot.ensure_in_sonarr(found[0])
+        if show is None or not episodes:
+            await interaction.followup.send(problem)
             return
         rate = await bot.size_rate()
-        plan = plan_episodes(chosen, datetime.now(timezone.utc), per_episode_estimate(show, rate.typical))
+        per_episode = per_episode_estimate(show, rate.typical)
         try:
             free = await asyncio.to_thread(bot.seerr.free_bytes, "tv")
         except Exception:  # noqa: BLE001 - only for the estimate
             free = None
-        view = EpisodeConfirm(bot, interaction.user, show, plan, free)
+        if not (folgen or "").strip():
+            loading = await asyncio.to_thread(bot.arrs["tv"].queued_ids)
+            picker = EpisodePicker(bot, interaction.user, show, episodes, loading, free, per_episode, added)
+            picker.message = await interaction.followup.send(embed=picker.embed(), view=picker, wait=True)
+            return
+        name = escape(str(show.get("title") or "?"))
+        try:
+            chosen = select_episodes(episodes, parse_episodes(folgen))
+        except ValueError as error:
+            await drop_added_show(bot, show, added)
+            await interaction.followup.send(f"⚠️ {error}")
+            return
+        if not chosen or len(chosen) > MAX_EPISODES:
+            await drop_added_show(bot, show, added)
+            await interaction.followup.send(
+                f"🔎 Diese Folgen gibt es bei **{name}** nicht: {escape(folgen.strip())}" if not chosen else
+                f"⚠️ Das wären {len(chosen)} Folgen, mehr als {MAX_EPISODES} auf einmal geht nicht.")
+            return
+        plan = plan_episodes(chosen, datetime.now(timezone.utc), per_episode)
+        view = EpisodeConfirm(bot, interaction.user, show, plan, free, added)
         if not plan.get and not plan.later:
+            await drop_added_show(bot, show, added)
             await interaction.followup.send(embed=view.embed())
             return
         view.message = await interaction.followup.send(embed=view.embed(), view=view, wait=True)
@@ -2168,41 +2400,6 @@ def extra_commands(bot: SeerrBot, requester) -> list[app_commands.Command]:
         if link:
             view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="In Jellyfin", emoji="▶️", url=link))
         await interaction.followup.send(embed=embed, view=view)
-
-    async def suggest_follow(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-        """Shows in Sonarr, and (from Seerr's search) shows that aren't there yet."""
-        text = current.strip()
-
-        async def search() -> list[Title]:
-            return await asyncio.to_thread(bot.seerr.search, text, "tv") if len(text) >= 2 else []
-        shows, found = await asyncio.gather(asyncio.wait_for(bot.sonarr_series(), AUTOCOMPLETE_SECONDS),
-                                            asyncio.wait_for(search(), AUTOCOMPLETE_SECONDS), return_exceptions=True)
-        shows = shows if isinstance(shows, list) else []
-        found = found if isinstance(found, list) else []
-        known = {s.get("tmdbId") for s in shows}
-        choices = [app_commands.Choice(name=shorten(f"{s.get('title', '?')} ({s.get('year')}) · in Sonarr", 100),
-                                       value=f"s:{s['id']}")
-                   for s in shows if text.casefold() in str(s.get("title", "")).casefold()]
-        choices += [app_commands.Choice(name=shorten(f"{t.label} · neu", 100), value=f"t:{t.tmdb_id}")
-                    for t in found if t.tmdb_id not in known]
-        return choices[:25]
-
-    async def resolve_show(text: str) -> tuple[int, str] | None:
-        """(TMDB id, name) of a picked suggestion or typed name: Sonarr first, then Seerr's search."""
-        value = text.strip()
-        shows = await bot.sonarr_series()
-        if value.startswith("s:") and value[2:].isdigit():
-            show = next((s for s in shows if s.get("id") == int(value[2:])), None)
-        else:
-            show = next((s for s in shows if str(s.get("title", "")).casefold().startswith(value.casefold())), None)
-        if show is not None and isinstance(show.get("tmdbId"), int) and show["tmdbId"] > 0:
-            year = show.get("year")
-            return show["tmdbId"], f"{show.get('title', '?')} ({year})" if year else str(show.get("title", "?"))
-        if value.startswith("t:") and value[2:].isdigit():
-            title = await asyncio.to_thread(bot.seerr.details, "tv", int(value[2:]))
-            return title.tmdb_id, title.label
-        found = await asyncio.to_thread(bot.seerr.search, value, "tv")
-        return (found[0].tmdb_id, found[0].label) if found else None
 
     @app_commands.command(name="verfolgen", description="Serie ab einer Folge verfolgen: jede neue Folge kommt von selbst")
     @app_commands.describe(serie="Die Serie. Leer lassen: was du verfolgst",

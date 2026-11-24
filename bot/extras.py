@@ -383,6 +383,68 @@ def episodes_deleted_text(count: int, freed: int, removed: tuple[int, int, int] 
     return text
 
 
+# --- /folgen picker: seasons and episodes to click ----------------------------------------------------------
+PICKER_PAGE = 75  # three menus of 25 episodes per page
+
+
+def season_numbers(episodes: list[dict]) -> list[int]:
+    """The seasons with episodes, specials (0) last."""
+    seasons = sorted({e["seasonNumber"] for e in episodes if isinstance(e.get("seasonNumber"), int)})
+    return [s for s in seasons if s > 0] + ([0] if 0 in seasons else [])
+
+
+def season_episodes(episodes: list[dict], season: int) -> list[dict]:
+    return sorted((e for e in episodes if e.get("seasonNumber") == season and isinstance(e.get("id"), int)),
+                  key=lambda e: e.get("episodeNumber") or 0)
+
+
+def first_season_to_pick(episodes: list[dict]) -> int:
+    """The latest season that still has missing episodes, else the latest season."""
+    seasons = [s for s in season_numbers(episodes) if s > 0] or season_numbers(episodes) or [1]
+    missing = [s for s in seasons if any(not e.get("hasFile") for e in season_episodes(episodes, s))]
+    return (missing or seasons)[-1]
+
+
+def episode_label(e: dict, anime: bool) -> str:
+    number = f"E{e.get('episodeNumber', 0):02d}"
+    if anime and isinstance(e.get("absoluteEpisodeNumber"), int):
+        number += f" · Folge {e['absoluteEpisodeNumber']}"
+    title = str(e.get("title") or "").strip()
+    return shorten(f"{number} · {title}" if title and title.upper() != "TBA" else number, 100)
+
+
+def episode_state(e: dict, loading: set[int], now: datetime, zone) -> str:
+    """What the menu shows below an episode."""
+    if e.get("hasFile"):
+        return "✅ schon da"
+    if e.get("id") in loading:
+        return "⬇️ lädt gerade"
+    when = parse_time(e.get("airDateUtc"))
+    if when is None:
+        return "📅 Termin noch offen"
+    if when > now:
+        return f"📅 erscheint {when.astimezone(zone):%d.%m.%Y}"
+    return f"🔎 erschienen {when.astimezone(zone):%d.%m.%Y}" + (", wird schon gesucht" if e.get("monitored") else "")
+
+
+def picker_lines(episodes: list[dict], selected: set[int], loading: set[int], now: datetime, zone,
+                 anime: bool) -> list[str]:
+    """The episodes of one page in the embed: there, loading, chosen, not chosen, still to come."""
+    lines = []
+    for e in episodes:
+        if e.get("hasFile"):
+            mark = "✅"
+        elif e.get("id") in loading:
+            mark = "⬇️"
+        elif e.get("id") in selected:
+            mark = "☑️"
+        else:
+            when = parse_time(e.get("airDateUtc"))
+            mark = "📅" if when is None or when > now else "⬜"
+        lines.append(f"{mark} {episode_label(e, anime)}")
+    return lines
+
+
 # --- early search ---------------------------------------------------------------------------------------
 def early_search_ids(episodes: list[dict], loading: set[int], now: datetime, ahead_days: int,
                      back_days: int = 2) -> list[int]:

@@ -292,6 +292,14 @@ class ArrClient:
         records = data.get("records") if isinstance(data, dict) else None
         return {r[key] for r in records or [] if isinstance(r, dict) and isinstance(r.get(key), int)}
 
+    def set_monitored(self, episode_ids: list[int], monitored: bool) -> None:
+        if episode_ids:
+            self._request("PUT", "/episode/monitor", body={"episodeIds": episode_ids, "monitored": monitored})
+
+    def remove_series(self, series_id: int) -> None:
+        """Takes a show out of Sonarr again (files stay; only used for shows the bot just added without files)."""
+        self._request("DELETE", f"/series/{series_id}", {"deleteFiles": "false", "addImportListExclusion": "false"})
+
     def search_episodes(self, episode_ids: list[int]) -> None:
         """Sonarr searches these episodes now on all indexers and takes the best release."""
         if episode_ids:

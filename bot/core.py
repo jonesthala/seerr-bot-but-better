@@ -663,7 +663,7 @@ HELP = {  # command → (who, example)
     "jellyfin-liste": (ADMINS, "/jellyfin-liste"),
     "jellyfin-entziehen": (ADMINS, "/jellyfin-entziehen @person"),
     "speicher": (ADMINS, "/speicher"),
-    "folgen": (ADMINS, "/folgen One Piece S23E18-E25"),
+    "folgen": (ADMINS, "/folgen Dexter"),
 }
 
 

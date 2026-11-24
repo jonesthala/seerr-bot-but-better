@@ -92,9 +92,11 @@ disk from running full.
   question. *Löschen* deletes a movie like `/löschen`; for episodes it deletes just their files in Sonarr, stops
   monitoring them (so they aren't fetched again) and removes their finished torrents. Only what is watched after
   the bot starts counts. `WATCHED_ASK=0` turns it off.
-- **`/folgen <serie> <folgen>`** (admins only, needs Sonarr): single episodes instead of whole seasons, e.g.
-  `S23E18-E25`, `S23` or, for anime, `1155-1170`. Shows what is there, what is missing and how much space it
-  needs; *Holen* monitors exactly these episodes in Sonarr and searches them.
+- **`/folgen <serie> [folgen]`** (admins only, needs Sonarr): single episodes instead of whole seasons. Without
+  `folgen` a picker opens: a season menu, the episodes with their titles and air dates to click (what is there or
+  downloading is marked), *Ganze Staffel*, the estimated size, *Holen*; picks across seasons add up. Or directly,
+  e.g. `S23E18-E25`, `S23` or, for anime, `1155-1170`. Shows that aren't in Sonarr yet are added without monitoring
+  anything, and taken out again if nothing is fetched. *Holen* monitors exactly these episodes and searches them.
 - **`/löschen <titel>`** (admins only): pick a movie or show from the library and delete it, files
   included, after a second confirmation click. It is reset in Seerr, so it can be requested again later.
   With qBittorrent access (setup step 5) it also removes the title's torrents with their files, so the space
