@@ -101,6 +101,7 @@
   // --- formatting -------------------------------------------------------------------------------
   function size(bytes) {
     if (bytes === null || bytes === undefined) return "?";
+    if (bytes <= 0) return "0 GB";
     const gb = bytes / GB;
     if (gb >= 10) return `${Math.round(gb)} GB`;
     if (gb >= 1) return `${gb.toFixed(1)} GB`;
@@ -227,12 +228,13 @@
     const previous = onModalClose;
     onModalClose = null;
     if (previous) previous();
-    modalBody.replaceChildren(
+    const parts = [
       h("div", { class: "modal-head" }, typeof title === "string" ? h("h2", null, title) : title,
         h("button", { class: "icon-btn", type: "button", "aria-label": "Schliessen", onclick: closeModal }, icon("x"))),
       h("div", { class: "modal-main" }, body),
-      foot ? h("div", { class: "modal-foot" }, foot) : null,
-    );
+    ];
+    if (foot) parts.push(h("div", { class: "modal-foot" }, foot));
+    modalBody.replaceChildren(...parts);
     modal.classList.toggle("wide", wide);
     onModalClose = onClose;
     if (!modal.open) modal.showModal();
