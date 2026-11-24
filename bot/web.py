@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import mimetypes
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -53,7 +54,10 @@ if TYPE_CHECKING:
 log = logging.getLogger("seerrbot.panel")
 
 STATIC = Path(__file__).with_name("panel_static")
-STATIC_FILES = {"/": "index.html", "/app.js": "app.js", "/style.css": "style.css", "/icon.svg": "icon.svg"}
+STATIC_FILES = {"/": "index.html", "/app.js": "app.js", "/style.css": "style.css", "/icon.svg": "icon.svg",
+                "/manifest.webmanifest": "manifest.webmanifest", "/icon-180.png": "icon-180.png",
+                "/icon-192.png": "icon-192.png", "/icon-512.png": "icon-512.png"}
+mimetypes.add_type("application/manifest+json", ".webmanifest")  # "add to home screen" as an app
 MAX_BODY = 64 * 1024
 PANEL = "Admin-Panel"
 ADDED_MINUTES = 30  # a show added to Sonarr only to look at its episodes goes again after this
