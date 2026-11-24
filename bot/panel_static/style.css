@@ -166,7 +166,7 @@ a.tile:hover { border-color: var(--line-strong); text-decoration: none; backgrou
 .bar.thin { height: 5px; }
 
 /* --- media items --- */
-.items { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 540px), 1fr)); gap: 12px; align-items: start; }
+.items { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 540px), 1fr)); gap: 12px; align-items: start; }
 .item { display: grid; grid-template-columns: auto 1fr; gap: 14px; padding: 14px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
 .item.simple { grid-template-columns: 1fr; }
 .item-body { display: grid; gap: 8px; min-width: 0; align-content: start; }
@@ -252,7 +252,7 @@ details.more summary:hover { color: var(--text); }
 .picker-sum strong { font-size: 14px; }
 
 /* --- calendar --- */
-.days { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 520px), 1fr)); gap: 18px 16px; align-items: start; }
+.days { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 520px), 1fr)); gap: 18px 16px; align-items: start; }
 .day h3 { color: var(--muted); font-size: 12.5px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
 .day h3.today { color: var(--accent); }
 .day-items { display: grid; gap: 6px; }
