@@ -240,6 +240,7 @@ class SeerrBot(discord.Client):
         self._library: tuple[float, list[dict], list[str]] = (0.0, [], [])  # (when loaded, items, genres)
         self._sonarr: tuple[float, list[dict]] = (0.0, [])  # (when loaded, shows) for /folgen suggestions
         self._background: set[asyncio.Task] = set()
+        self.panel = None  # the admin panel in the browser, if PANEL_PORT is set
 
     async def setup_hook(self) -> None:
         guild = discord.Object(id=self.settings.guild_id)
@@ -261,6 +262,10 @@ class SeerrBot(discord.Client):
             self.digest_loop.start()
         if self.jellyfin is not None:
             self.abo_loop.start()
+        if self.settings.panel_port:
+            from .web import start_panel  # aiohttp comes with discord.py
+
+            self.panel = await start_panel(self)
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s", self.user)
@@ -461,7 +466,7 @@ class SeerrBot(discord.Client):
 
     async def auto_abo(self, user_id: int, title: Title) -> str:
         """After a show request: subscribe the requester, so new episodes arrive as DM. Returns the note for them."""
-        if self.jellyfin is None or title.kind != "tv":
+        if self.jellyfin is None or title.kind != "tv" or not user_id:
             return ""
         try:
             show = next((s for s in await self.series_list() if s[2] == title.tmdb_id), None)

@@ -4,6 +4,9 @@ services:
     container_name: seerrbot
     restart: unless-stopped
     env_file: .env
+    # Admin panel in the browser (PANEL_PORT=8095 in .env). Only open it to your home network.
+    # ports:
+    #   - "8095:8095"
     volumes:
       - seerrbot-data:/data  # who requested what, approval messages
 

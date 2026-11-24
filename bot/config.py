@@ -129,6 +129,11 @@ class Settings:
     sonarr_api_key: str = ""
     radarr_url: str = ""
     radarr_api_key: str = ""
+    # Admin panel in the browser (login with a Jellyfin administrator); 0 = off
+    panel_port: int = 0
+    panel_user_id: int | None = None  # Discord account the panel acts for (abos, "it's there" mentions)
+    panel_mc_url: str = ""  # optional: the Minecraft bot's admin API, shown as its own page
+    panel_mc_token: str = ""
 
     @property
     def torrent_cleanup_enabled(self) -> bool:
@@ -198,13 +203,23 @@ class Settings:
         bitrate = _int("JELLYFIN_FRIEND_BITRATE_MBIT", 4)
         if bitrate < 0:
             raise ConfigError("JELLYFIN_FRIEND_BITRATE_MBIT must be 0 (no limit) or more")
+        panel_port = _int("PANEL_PORT", 0)
+        if not 0 <= panel_port <= 65535:
+            raise ConfigError("PANEL_PORT must be a port number (or 0 for off)")
+        if panel_port and not api_url:
+            raise ConfigError("PANEL_PORT needs JELLYFIN_API_URL: you log in to the panel with a Jellyfin admin account")
+        admin_ids = _id_set("DISCORD_ADMIN_USER_IDS")
+        panel_user = _int("PANEL_DISCORD_USER_ID", 0) or (next(iter(admin_ids)) if len(admin_ids) == 1 else None)
+        mc_url, mc_token = _url("PANEL_MC_URL"), _text("PANEL_MC_TOKEN")
+        if mc_url and len(mc_token) < 32:
+            raise ConfigError("PANEL_MC_URL needs PANEL_MC_TOKEN (the Minecraft bot's WEB_TOKEN, at least 32 characters)")
         return cls(
             discord_token=_token(),
             guild_id=_int("DISCORD_GUILD_ID"),
             channel_id=_int("DISCORD_CHANNEL_ID"),
             request_role_id=_int("DISCORD_REQUEST_ROLE_ID", 0) or None,
             admin_role_id=_int("DISCORD_ADMIN_ROLE_ID", 0) or None,
-            admin_user_ids=_id_set("DISCORD_ADMIN_USER_IDS"),
+            admin_user_ids=admin_ids,
             seerr_url=url,
             seerr_api_key=_required("SEERR_API_KEY"),
             seerr_language=_text("SEERR_LANGUAGE", "de") or "de",
@@ -236,6 +251,10 @@ class Settings:
             sonarr_api_key=_text("SONARR_API_KEY"),
             radarr_url=_url("RADARR_URL"),
             radarr_api_key=_text("RADARR_API_KEY"),
+            panel_port=panel_port,
+            panel_user_id=panel_user,
+            panel_mc_url=mc_url,
+            panel_mc_token=mc_token,
         )
 
     def page_url(self, kind: str, tmdb_id: int) -> str | None:

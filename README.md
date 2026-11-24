@@ -121,6 +121,17 @@ disk from running full.
 Seasons and quality are chosen per request. Seerr only requests whole seasons; for single episodes, admins
 use `/folgen`, which talks to Sonarr directly.
 
+**Admin panel in the browser** (optional, see [setup](#6-admin-panel-in-the-browser-optional))
+- Everything an admin does in Discord, on one page and clearer: an overview with free space, running downloads and
+  what is coming; *Zu erledigen* with approvals, "Geschaut, löschen?", follow wishes and Jellyfin accounts; all
+  torrents with pause and resume; search with request, single episodes (season tabs, episode titles, checkboxes),
+  following and deleting; the calendar and the followed shows.
+- Discord stays in step: an approval clicked in the panel closes the buttons in Discord, and the requester still
+  gets the message.
+- Optional page for the Minecraft bot ([mc-discord-bot](https://github.com/jonesthala/mc-discord-bot)): start and
+  stop, players and RAM, backups, whitelist, console and logs.
+- Log in with a Jellyfin administrator account. No extra password, nothing stored but a signed cookie.
+
 ## How it works
 
 ```mermaid
@@ -245,6 +256,19 @@ set -a && . ./.env && set +a
 python -m bot    # remembers its state in ./data unless DATA_DIR says otherwise
 ```
 
+### 6. Admin panel in the browser (optional)
+
+1. Needs `JELLYFIN_API_URL` (setup step 4): you log in with a Jellyfin account that is administrator.
+2. Set `PANEL_PORT=8095` in `.env` and publish the port, only to your home network or Tailscale: uncomment
+   `ports:` in `docker-compose.yml`, or add `-p 8095:8095` to `docker run`.
+3. Open `http://<docker host>:8095` and log in.
+
+The panel acts for the Discord account in `PANEL_DISCORD_USER_ID` (or the only admin ID): that account gets the
+abo DMs and the "it's there" message for requests made in the panel.
+
+For the Minecraft page, switch on the admin API of the Minecraft bot (`WEB_PORT`, `WEB_TOKEN` there) and set
+`PANEL_MC_URL` (e.g. `http://192.168.1.20:8096`) and `PANEL_MC_TOKEN` (the same token) here.
+
 ## Settings
 
 | Variable | Default | Meaning |
@@ -276,13 +300,21 @@ python -m bot    # remembers its state in ./data unless DATA_DIR says otherwise
 | `SEERR_LANGUAGE` | `de` | Language of titles and descriptions |
 | `SEERR_USER_ID` | empty | Make requests as this Seerr user; its permissions decide whether they wait for approval |
 | `SEERR_PUBLIC_URL` | empty | Link to Seerr in the bot's messages |
+| `PANEL_PORT` | `0` | Admin panel in the browser on this port (inside the container); `0` = off |
+| `PANEL_DISCORD_USER_ID` | the only admin ID | Discord account the panel acts for (abos, "it's there" messages) |
+| `PANEL_MC_URL`, `PANEL_MC_TOKEN` | empty | Minecraft page: the Minecraft bot's admin API and its `WEB_TOKEN` |
 
 ## Security
 
 - The Seerr API key can do everything an admin can. Keep `.env` private (`chmod 600`) and out of Git.
 - Requests made as the admin are approved at once. If others can use the bot, set `SEERR_USER_ID` or a
   request role.
-- The container runs as an unprivileged user and needs no ports.
+- The container runs as an unprivileged user and needs no ports, unless the admin panel is on.
+- The admin panel lets in only Jellyfin administrators. The password goes to Jellyfin once and is not kept; the
+  session Jellyfin opens for the check is closed again. The login is a signed cookie (HttpOnly, SameSite=Strict,
+  30 days; the key is `panel.key` in the data volume, delete it to log everyone out). Five wrong passwords lock
+  logins for 15 minutes. Every change in the panel is logged with the user name. It is plain HTTP: keep the port in
+  your home network or Tailscale, or put a reverse proxy with HTTPS in front.
 - `/löschen` removes files for good. Only the admins you list can use it, and it always asks twice.
 - Approve and decline buttons check on every click that the person is an admin.
 - The bot only ever mentions the person who made a request, never `@everyone` or roles.

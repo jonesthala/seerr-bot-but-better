@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0d12">
+  <meta name="referrer" content="no-referrer">
+  <title>Homelab Admin</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="login" class="login" hidden>
+    <form id="login-form" class="login-card" autocomplete="on">
+      <img src="icon.svg" alt="" class="login-logo" width="48" height="48">
+      <h1>Homelab Admin</h1>
+      <p class="muted">Mit deinem Jellyfin-Konto anmelden. Nur Jellyfin-Admins kommen hinein.</p>
+      <label>Benutzername<input name="name" autocomplete="username" required autocapitalize="none" spellcheck="false"></label>
+      <label>Passwort<input name="password" type="password" autocomplete="current-password" required></label>
+      <p id="login-error" class="form-error" role="alert" hidden></p>
+      <button type="submit" class="btn primary wide">Anmelden</button>
+    </form>
+  </div>
+
+  <div id="shell" class="shell" hidden>
+    <header class="topbar">
+      <button id="menu-button" class="icon-btn" aria-label="Menü" aria-expanded="false" aria-controls="nav"></button>
+      <span class="brand-small"><img src="icon.svg" alt="" width="22" height="22"> Homelab Admin</span>
+    </header>
+    <nav id="nav" class="sidebar" aria-label="Bereiche">
+      <a class="brand" href="#/uebersicht"><img src="icon.svg" alt="" width="28" height="28"><span>Homelab Admin</span></a>
+      <div id="nav-links" class="nav-links"></div>
+      <div class="nav-foot">
+        <span id="user-name" class="user-name"></span>
+        <button id="logout" class="btn ghost small" type="button">Abmelden</button>
+      </div>
+    </nav>
+    <div id="scrim" class="scrim" hidden></div>
+    <main id="page" class="page" tabindex="-1"></main>
+  </div>
+
+  <dialog id="modal" class="modal"><div id="modal-body"></div></dialog>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>
