@@ -216,6 +216,7 @@ class WelcomeTest(unittest.TestCase):
         for part in ("max", "pw123", "http://100.1.2.3:8096", "https://login.tailscale.com/admin/invite/x",
                      "Quick Connect", "SyncPlay"):
             self.assertIn(part, text)
+        self.assertIn("im Browser <http://100.1.2.3:8096>", text)  # PC: clickable, without a link preview
         self.assertLess(len(text), 2000)  # one Discord message
 
 
