@@ -23,6 +23,7 @@ from .core import GB, REQUEST_PENDING, SeerrError, Title, declined_text
 from .discord_bot import approved_text, escape, login_view
 from .extras import BRAKE_MARGIN, first_season_to_pick, parse_start, per_episode_estimate, plan_episodes, plan_lines
 from .jellyfin import JellyfinError
+from .notes import NotesError, read_notes
 from .panel import (
     SESSION_COOKIE,
     SESSION_DAYS,
@@ -145,7 +146,7 @@ class Panel:
                     log.info("Panel: %s %s by %s", request.method, path, request.get("user"))
             try:
                 response = await handler(request)
-            except (PanelError, SeerrError, ArrError, JellyfinError) as error:
+            except (PanelError, SeerrError, ArrError, JellyfinError, NotesError) as error:
                 response = web.json_response({"error": str(error)}, status=400)
             except web.HTTPException as error:
                 _secure(error)
@@ -182,6 +183,7 @@ class Panel:
             web.post("/api/follows/add", self.follow_add),
             web.post("/api/follows/stop", self.follow_stop),
             web.get("/api/calendar", self.calendar),
+            web.get("/api/todos", self.todos),
             web.route("*", "/api/mc/{tail:.+}", self.mc_proxy),
         ])
         return app
@@ -251,6 +253,7 @@ class Panel:
             "qbit": bot.qbit is not None,
             "jellyfin": bot.jellyfin is not None,
             "discord_owner": self.owner is not None,
+            "todos": bool(self.settings.panel_todo_dir),
         })
 
     # --- overview ---------------------------------------------------------------------------
@@ -319,7 +322,15 @@ class Panel:
                 "request": False, "pending": False, "state_text": "", "progress": progress_data(kind, progress, live, now),
             })
         active = sum(1 for c in cards if c["progress"] for d in c["progress"]["downloads"] if d["state"] == "downloading")
+        todos = None
+        if self.settings.panel_todo_dir:
+            try:
+                found = await asyncio.to_thread(self._notes)
+                todos = {key: sum(n[key] for n in found["notes"]) for key in ("open", "important", "ideas")}
+            except NotesError:
+                todos = None
         return web.json_response({
+            "todos": todos,
             "free": free, "min_free": self.settings.min_free_gb * GB, "brake": self.brake_info(), "cards": cards,
             "speed": sum(c["progress"]["speed"] for c in cards if c["progress"]), "active": active,
             "problems": problems, "inbox": await self.inbox_counts(),
@@ -688,6 +699,16 @@ class Panel:
             loading_movies = await asyncio.to_thread(radarr.queued_ids)
         return web.json_response({"days": calendar_days(episodes, movies, loading, loading_movies, start, end, now,
                                                         self.settings.zone), "length": days})
+
+    # --- to-dos: checklists and ideas from Markdown notes (read only) -------------------------------
+    def _notes(self) -> dict[str, Any]:
+        s = self.settings
+        return read_notes(s.panel_todo_dir, s.panel_todo_files, s.panel_obsidian_vault)
+
+    async def todos(self, request: web.Request) -> web.Response:
+        if not self.settings.panel_todo_dir:
+            raise PanelError("Die To-do-Seite ist nicht eingerichtet (PANEL_TODO_DIR).")
+        return web.json_response(await asyncio.to_thread(self._notes))
 
     # --- Minecraft: passed on to the Minecraft bot's admin API ----------------------------------
     async def mc_proxy(self, request: web.Request) -> web.Response:

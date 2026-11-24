@@ -130,6 +130,8 @@ use `/folgen`, which talks to Sonarr directly.
   gets the message.
 - Optional page for the Minecraft bot ([mc-discord-bot](https://github.com/jonesthala/mc-discord-bot)): start and
   stop, players and RAM, backups, whitelist, console and logs.
+- Optional to-do page from your Markdown notes, e.g. an Obsidian vault: checklists and ideas by section, open or all,
+  with a filter and "open in Obsidian" links. Read only.
 - Log in with a Jellyfin administrator account. No extra password, nothing stored but a signed cookie.
 
 ## How it works
@@ -266,6 +268,11 @@ python -m bot    # remembers its state in ./data unless DATA_DIR says otherwise
 The panel acts for the Discord account in `PANEL_DISCORD_USER_ID` (or the only admin ID): that account gets the
 abo DMs and the "it's there" message for requests made in the panel.
 
+For the to-do page, make a folder of Markdown notes readable for the container (for example a git checkout of your
+Obsidian vault that a timer pulls, mounted with `-v /opt/notes:/notes:ro`) and set `PANEL_TODO_DIR=/notes` and
+`PANEL_TODO_FILES` (paths inside it, comma-separated). `- [ ]`/`- [x]` are tasks, other list items ideas, `✅` in front
+or a heading like `## ✅ Done` counts as done, `⭐` as a favourite. `PANEL_OBSIDIAN_VAULT` adds "open in Obsidian" links.
+
 For the Minecraft page, switch on the admin API of the Minecraft bot (`WEB_PORT`, `WEB_TOKEN` there) and set
 `PANEL_MC_URL` (e.g. `http://192.168.1.20:8096`) and `PANEL_MC_TOKEN` (the same token) here.
 
@@ -303,6 +310,8 @@ For the Minecraft page, switch on the admin API of the Minecraft bot (`WEB_PORT`
 | `PANEL_PORT` | `0` | Admin panel in the browser on this port (inside the container); `0` = off |
 | `PANEL_DISCORD_USER_ID` | the only admin ID | Discord account the panel acts for (abos, "it's there" messages) |
 | `PANEL_MC_URL`, `PANEL_MC_TOKEN` | empty | Minecraft page: the Minecraft bot's admin API and its `WEB_TOKEN` |
+| `PANEL_TODO_DIR`, `PANEL_TODO_FILES` | empty | To-do page: a folder of Markdown notes and which notes to show |
+| `PANEL_OBSIDIAN_VAULT` | empty | Vault name for "open in Obsidian" links on the to-do page |
 
 ## Security
 

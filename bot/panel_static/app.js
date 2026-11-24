@@ -34,6 +34,11 @@
     list: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
     external: '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3"/>',
     key: '<circle cx="7.5" cy="15.5" r="5.5"/><path d="M21 2l-9.6 9.6M15.5 7.5l3 3L22 7l-3-3"/>',
+    checklist: '<path d="M11 6h10M11 12h10M11 18h10"/><path d="M3 6l1.5 1.5L7 5M3 12l1.5 1.5L7 11M3 18l1.5 1.5L7 17"/>',
+    square: '<rect x="4" y="4" width="16" height="16" rx="3"/>',
+    checkSquare: '<rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8.5 12.5l2.5 2.5 5-6"/>',
+    bulb: '<path d="M9 18h6M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/>',
+    dot: '<circle cx="12" cy="12" r="2.5"/>',
   };
 
   function icon(name, cls = "i") {
@@ -66,7 +71,25 @@
     return el;
   }
 
-  // Bot messages use a little Discord markup: **bold**, `code`, "-# " small lines and \-escaped characters.
+  // Bot messages and notes use a little Markdown: **bold**, *italic*, ~~struck~~, `code`, "-# " small lines and
+  // \-escaped characters. Built as DOM nodes, never as HTML.
+  const INLINE = /\*\*(.+?)\*\*|~~(.+?)~~|`([^`]+)`|(?<![\w*])\*(?![\s*])([^*]+?)\*(?![\w*])/g;
+  function inline(target, text, restore) {
+    const pattern = new RegExp(INLINE.source, "g");
+    let last = 0;
+    let match;
+    while ((match = pattern.exec(text))) {
+      if (match.index > last) target.append(restore(text.slice(last, match.index)));
+      if (match[1] !== undefined) target.append(inline(h("strong"), match[1], restore));
+      else if (match[2] !== undefined) target.append(inline(h("s"), match[2], restore));
+      else if (match[3] !== undefined) target.append(h("code", null, restore(match[3])));
+      else target.append(inline(h("em"), match[4], restore));
+      last = pattern.lastIndex;
+    }
+    if (last < text.length) target.append(restore(text.slice(last)));
+    return target;
+  }
+
   function rich(text, cls = "rich") {
     const box = h("div", { class: cls });
     const lines = String(text ?? "").split("\n");
@@ -83,15 +106,7 @@
         return `${escaped.length - 1}`;
       });
       const restore = (s) => s.replace(/(\d+)/g, (_, n) => escaped[Number(n)]);
-      const pattern = /\*\*(.+?)\*\*|`([^`]+)`/g;
-      let last = 0;
-      let match;
-      while ((match = pattern.exec(safe))) {
-        if (match.index > last) target.append(restore(safe.slice(last, match.index)));
-        target.append(match[1] !== undefined ? h("strong", null, restore(match[1])) : h("code", null, restore(match[2])));
-        last = pattern.lastIndex;
-      }
-      if (last < safe.length) target.append(restore(safe.slice(last)));
+      inline(target, safe, restore);
       if (target !== box) box.append(target);
       if (index < lines.length - 1) box.append("\n");
     });
@@ -275,6 +290,7 @@
   const PAGES = [
     { id: "uebersicht", label: "Übersicht", icon: "home", render: renderOverview },
     { id: "erledigen", label: "Zu erledigen", icon: "inbox", render: renderInbox, badge: true },
+    { id: "todos", label: "Brain-To-dos", icon: "checklist", render: renderTodos, need: "todos" },
     { id: "downloads", label: "Downloads", icon: "download", render: renderDownloads, need: "qbit" },
     { id: "suchen", label: "Suchen & holen", icon: "search", render: renderSearch },
     { id: "kalender", label: "Kalender", icon: "calendar", render: renderCalendar, need: "tv" },
@@ -426,6 +442,11 @@
           h("span", { class: "tile-value" }, todo ? String(todo) : "Nichts"),
           h("span", { class: "tile-sub" }, todoParts.join(" · ") || "alles erledigt")),
       ];
+      if (session.todos && data.todos) {
+        tiles.push(h("a", { class: `tile ${data.todos.important ? "warn" : ""}`, href: "#/todos" }, h("span", { class: "tile-label" }, icon("checklist"), "Brain-To-dos"),
+          h("span", { class: "tile-value" }, `${data.todos.open} offen`),
+          h("span", { class: "tile-sub" }, [data.todos.important && `${data.todos.important} wichtig`, data.todos.ideas && `${data.todos.ideas} Ideen`].filter(Boolean).join(" · ") || "nichts Wichtiges")));
+      }
       if (session.mc) {
         const running = mc && !mc.error && mc.running;
         tiles.push(h("a", { class: `tile ${running ? "good" : ""}`, href: "#/minecraft" }, h("span", { class: "tile-label" }, icon("cube"), "Minecraft"),
@@ -861,6 +882,74 @@
         if (!fetched && data.added) api("/api/episodes/close", { body: { series_id: data.series_id } }).then((r) => toast(r && r.message)).catch(() => {});
       },
     });
+  }
+
+  // --- Brain-To-dos (read only) --------------------------------------------------------------------
+  const todoState = { filter: "open", query: "" };
+
+  async function renderTodos(token) {
+    const content = h("div", null, loadingRow());
+    const search = h("input", { type: "search", placeholder: "Filtern, z.B. Jellyfin oder Platte", value: todoState.query, "aria-label": "Filtern", autocomplete: "off" });
+    const filter = h("div", { class: "segmented", role: "group", "aria-label": "Anzeigen" });
+    let data = null;
+
+    const matches = (item, query) => !query || item.text.toLowerCase().includes(query) || item.children.some((c) => c.text.toLowerCase().includes(query));
+    const row = (item, sectionDone, child = false) => {
+      const done = item.done || sectionDone;
+      const mark = item.task ? icon(done ? "checkSquare" : "square", `i todo-mark ${done ? "done" : ""}`)
+        : icon(child ? "dot" : done ? "check" : "bulb", `i todo-mark ${done ? "done" : child ? "" : "idea"}`);
+      const kids = item.children.filter((c) => todoState.filter === "all" || !(c.done || sectionDone));
+      return h("li", { class: `todo ${done ? "done" : ""}` }, mark,
+        h("div", { class: "todo-body" },
+          h("div", { class: "todo-text" }, item.star ? h("span", { class: "star", title: "Favorit" }, "★") : null, rich(item.text)),
+          kids.length ? h("ul", { class: "todo-children" }, kids.map((c) => row(c, sectionDone, true))) : null));
+    };
+    const draw = () => {
+      const query = todoState.query.trim().toLowerCase();
+      const parts = [];
+      if (data.fetched) parts.push(h("p", { class: "small muted todo-stand" }, `Stand des Brains: ${ago(data.fetched)} von GitHub geholt. Es wird alle 5 Minuten aktualisiert.`));
+      parts.push(h("div", { class: "todo-grid" }, data.notes.map((note) => {
+        const sections = note.sections.map((section) => {
+          const items = section.items.filter((item) => (todoState.filter === "all" || !(item.done || section.done)) && matches(item, query));
+          if (!items.length) return null;
+          return h("div", { class: "todo-section" },
+            h("h3", { class: section.important ? "important" : null }, section.title || "Ohne Überschrift", h("span", { class: "faint" }, ` · ${items.length}`)),
+            h("ul", { class: "todo-list" }, items.map((item) => row(item, section.done))));
+        }).filter(Boolean);
+        const counts = [];
+        if (note.open) counts.push(h("span", { class: "pill amber" }, `${note.open} offen`));
+        if (note.important) counts.push(h("span", { class: "pill red" }, `${note.important} wichtig`));
+        if (note.ideas) counts.push(h("span", { class: "pill violet" }, `${note.ideas} Ideen`));
+        if (note.done) counts.push(h("span", { class: "pill green" }, `${note.done} erledigt`));
+        let body;
+        if (note.missing) body = banner("warn", `\`${note.path}\` fehlt in der Kopie des Brains.`);
+        else if (sections.length) body = sections;
+        else body = h("p", { class: "muted" }, query ? "Nichts passt zum Filter." : "Alles erledigt.");
+        return h("section", { class: "card todo-card" },
+          h("div", { class: "row between" }, h("div", { class: "row" }, h("h2", null, note.title), counts),
+            note.obsidian ? h("a", { class: "btn ghost small", href: note.obsidian }, icon("external"), "In Obsidian öffnen") : null),
+          body);
+      })));
+      content.replaceChildren(...parts);
+    };
+    const drawFilter = () => filter.replaceChildren(...[["open", "Offen"], ["all", "Alle"]].map(([id, label]) => h("button", {
+      type: "button", class: id === todoState.filter ? "active" : "", onclick: () => { todoState.filter = id; drawFilter(); if (data) draw(); },
+    }, label)));
+    search.addEventListener("input", () => {
+      todoState.query = search.value;
+      if (data) draw();
+    });
+    const refresh = async () => {
+      const answer = await api("/api/todos");
+      if (token !== renderToken) return;
+      data = answer;
+      draw();
+    };
+    drawFilter();
+    page.append(head("Brain-To-dos", "Offene Punkte und Ideen aus deinem Brain. Nur zum Lesen: Ändern in Obsidian, hier erscheint es nach ein paar Minuten.", filter),
+      h("div", { class: "todo-search" }, search), content);
+    await load(token, content, refresh);
+    every(60000, () => load(token, content, refresh, true));
   }
 
   // --- Kalender -----------------------------------------------------------------------------------

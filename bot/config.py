@@ -134,6 +134,9 @@ class Settings:
     panel_user_id: int | None = None  # Discord account the panel acts for (abos, "it's there" mentions)
     panel_mc_url: str = ""  # optional: the Minecraft bot's admin API, shown as its own page
     panel_mc_token: str = ""
+    panel_todo_dir: str = ""  # optional: a folder of Markdown notes (e.g. an Obsidian vault), shown as a to-do page
+    panel_todo_files: tuple[str, ...] = ()  # which notes, relative to that folder
+    panel_obsidian_vault: str = ""  # vault name for "open in Obsidian" links
 
     @property
     def torrent_cleanup_enabled(self) -> bool:
@@ -210,6 +213,11 @@ class Settings:
             raise ConfigError("PANEL_PORT needs JELLYFIN_API_URL: you log in to the panel with a Jellyfin admin account")
         admin_ids = _id_set("DISCORD_ADMIN_USER_IDS")
         panel_user = _int("PANEL_DISCORD_USER_ID", 0) or (next(iter(admin_ids)) if len(admin_ids) == 1 else None)
+        todo_dir, todo_files = _text("PANEL_TODO_DIR"), _names("PANEL_TODO_FILES")
+        if todo_dir and not todo_files:
+            raise ConfigError("PANEL_TODO_DIR needs PANEL_TODO_FILES: the notes to show, comma-separated")
+        if any(f.startswith(("/", "\\")) or ".." in f.replace("\\", "/").split("/") for f in todo_files):
+            raise ConfigError("PANEL_TODO_FILES must be paths inside PANEL_TODO_DIR, like Notes/Todo.md")
         mc_url, mc_token = _url("PANEL_MC_URL"), _text("PANEL_MC_TOKEN")
         if mc_url and len(mc_token) < 32:
             raise ConfigError("PANEL_MC_URL needs PANEL_MC_TOKEN (the Minecraft bot's WEB_TOKEN, at least 32 characters)")
@@ -255,6 +263,9 @@ class Settings:
             panel_user_id=panel_user,
             panel_mc_url=mc_url,
             panel_mc_token=mc_token,
+            panel_todo_dir=todo_dir,
+            panel_todo_files=todo_files,
+            panel_obsidian_vault=_text("PANEL_OBSIDIAN_VAULT"),
         )
 
     def page_url(self, kind: str, tmdb_id: int) -> str | None:
