@@ -2080,19 +2080,30 @@ class MangaPicker(MangaView):
         self.free: int | None = None
         self.typed = ""
         self.problem = ""
+        self.groups = list(dict.fromkeys(p.group for p in parts))  # several series in one pack: one at a time
+        self.group = self.groups[0] if self.groups else ""
         self.render()
 
     @property
+    def group_keys(self) -> list[int]:
+        return [i for i, p in enumerate(self.parts) if p.group == self.group]
+
+    @property
     def open_keys(self) -> list[int]:
-        return [i for i in range(len(self.parts)) if i not in self.have]
+        """What can still be picked in the series shown."""
+        return [i for i in self.group_keys if i not in self.have]
 
     def apply(self, text: str) -> None:
+        """A typed choice, for the series shown; the choice in other series stays."""
         self.typed = text.strip()
+        keys = self.group_keys
         try:
-            self.chosen = {i for i in parse_selection(text, self.parts) if i not in self.have}
-            self.problem = "" if self.chosen else "Das ist schon alles da."
+            picked = {keys[j] for j in parse_selection(text, [self.parts[i] for i in keys])} - self.have
         except ValueError as error:
             self.problem = str(error)
+            return
+        self.chosen = (self.chosen - set(keys)) | picked
+        self.problem = "" if picked else "Das ist schon alles da."
 
     @property
     def size(self) -> int:
@@ -2105,14 +2116,26 @@ class MangaPicker(MangaView):
     def render(self) -> None:
         self.clear_items()
         keys = self.open_keys
+        if len(self.groups) > 1:
+            series = discord.ui.Select(placeholder="Serie", row=0, options=[
+                discord.SelectOption(label=shorten(g or "Sonstiges", 100), value=str(n), default=g == self.group)
+                for n, g in enumerate(self.groups[:25])])
+
+            async def switched(interaction: discord.Interaction) -> None:
+                self.group = self.groups[int(series.values[0])]
+                self.problem = ""
+                self.render()
+                await interaction.response.edit_message(embed=self.embed(), view=self)
+            series.callback = switched
+            self.add_item(series)
         if 0 < len(keys) <= 25:
-            select = discord.ui.Select(placeholder="Bände/Kapitel anklicken", min_values=0, max_values=len(keys), row=0,
+            select = discord.ui.Select(placeholder="Bände/Kapitel anklicken", min_values=0, max_values=len(keys), row=1,
                                        options=[discord.SelectOption(label=shorten(self.parts[i].label, 100), value=str(i),
                                                                      description=size_text(self.parts[i].size),
                                                                      default=i in self.chosen) for i in keys])
 
             async def picked(interaction: discord.Interaction) -> None:
-                self.chosen = {int(v) for v in select.values}
+                self.chosen = (self.chosen - set(keys)) | {int(v) for v in select.values}
                 self.problem = ""
                 self.render()
                 await interaction.response.edit_message(embed=self.embed(), view=self)
@@ -2123,7 +2146,7 @@ class MangaPicker(MangaView):
                    ("Laden", discord.ButtonStyle.success, self.load, not self.chosen or self.too_big),
                    ("Abbrechen", discord.ButtonStyle.secondary, self.cancel, False)]
         for label, style, callback, disabled in buttons:
-            button = discord.ui.Button(label=label, style=style, disabled=disabled, row=1)
+            button = discord.ui.Button(label=label, style=style, disabled=disabled, row=2)
             button.callback = callback
             self.add_item(button)
 
@@ -2136,6 +2159,8 @@ class MangaPicker(MangaView):
                          f" · {size_text(self.size)}")
         else:
             lines.append("**Ausgewählt:** noch nichts")
+        if len(self.groups) > 1:
+            lines.append(f"**Serie:** {escape(self.group or 'Sonstiges')} (oben umschalten, die Auswahl bleibt)")
         if len(self.open_keys) > 25:
             lines.append("-# Zu viele zum Anklicken: «Eintippen …» und z.B. `10-14`, `Kapitel 100-120` oder `alle`.")
         if self.problem:
@@ -2152,7 +2177,7 @@ class MangaPicker(MangaView):
         return embed
 
     async def all(self, interaction: discord.Interaction) -> None:
-        self.chosen = set(self.open_keys)
+        self.chosen |= set(self.open_keys)
         self.problem = ""
         self.render()
         await interaction.response.edit_message(embed=self.embed(), view=self)

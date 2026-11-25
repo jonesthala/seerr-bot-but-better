@@ -256,8 +256,8 @@ details.more summary:hover { color: var(--text); }
 .manga-hit { grid-template-columns: minmax(0, 1fr) auto; width: 100%; text-align: left; color: var(--text); font: inherit; cursor: pointer; }
 .manga-hit:hover { border-color: var(--line-strong); background: var(--surface-2); }
 .manga-parts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 220px), 1fr)); gap: 2px 8px; max-height: min(52vh, 540px); overflow: auto; overscroll-behavior: contain; }
-.manga-typed { flex-wrap: nowrap; }
 .manga-typed input { width: 150px; }
+.manga-typed select { width: auto; max-width: 220px; }
 .manga-free { margin-top: 10px; }
 
 /* --- brain to-dos --- */

@@ -1066,8 +1066,12 @@
     none.onclick = () => { chosen.clear(); drawList(); drawSummary(); };
     const typed = h("input", { placeholder: data.parts.some((p) => p.kind === "band") ? "z.B. 10-14" : "z.B. 100-120", "aria-label": "Bereich eintippen", maxlength: 200 });
     const apply = h("button", { class: "btn small", type: "button" }, "Anhaken");
+    // A pack with several series: a typed range is meant for one of them
+    const groups = [...new Set(data.parts.map((p) => p.group))];
+    const groupSelect = groups.length > 1 ? h("select", { "aria-label": "Für welche Serie" }, groups.map((g) => h("option", { value: g }, g))) : null;
     apply.onclick = () => {
-      const keys = pickParts(typed.value, data.parts);
+      const scope = groupSelect ? data.parts.filter((p) => p.group === groupSelect.value) : data.parts;
+      const keys = pickParts(typed.value, scope);
       if (keys === null) {
         toast("Das verstehe ich nicht. Beispiele: 10-14, Band 3, Kapitel 100-120, alle.", "bad");
         return;
@@ -1104,7 +1108,7 @@
       title,
       wide: true,
       body: h("div", { class: "stack" },
-        h("div", { class: "row" }, all, none, h("div", { class: "row manga-typed" }, typed, apply)),
+        h("div", { class: "row" }, all, none, h("div", { class: "row manga-typed" }, groupSelect, typed, apply)),
         h("p", { class: "small muted" }, "Tipp: Mit gedrückter Umschalttaste einen ganzen Bereich anhaken."),
         list),
       foot: [summary, h("button", { class: "btn ghost", type: "button", onclick: closeModal }, "Abbrechen"), loadButton],

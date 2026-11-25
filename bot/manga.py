@@ -465,7 +465,7 @@ def part_rows(parts: list[Part], by_path: dict[str, dict] | None = None) -> list
     for index, p in enumerate(parts):
         chosen, progress = part_state(p, by_path) if by_path is not None else (False, 0.0)
         rows.append({"key": index, "label": p.label, "kind": p.kind, "number": p.number, "last": p.last, "size": p.size,
-                     "have": chosen, "percent": round(100 * progress)})
+                     "group": p.group, "have": chosen, "percent": round(100 * progress)})
     return rows
 
 
