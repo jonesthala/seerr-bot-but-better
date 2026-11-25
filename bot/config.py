@@ -144,11 +144,19 @@ class Settings:
     manga_dir: str = ""  # only needed if the bot should create the category: the save path as qBittorrent sees it
     manga_reader_url: str = ""  # link to the reader, e.g. http://manga.home
     nyaa_url: str = "https://nyaa.si"
+    # optional: Kavita scans a finished manga right away, the message waits until Kavita has it
+    kavita_url: str = ""
+    kavita_api_key: str = ""  # auth key of a Kavita admin
+    kavita_library_dir: str = "/manga"  # the manga category's folder as Kavita sees it
 
     @property
     def manga_enabled(self) -> bool:
         return bool(self.prowlarr_url and self.prowlarr_api_key and self.qbittorrent_url and self.qbittorrent_username
                     and self.qbittorrent_password)
+
+    @property
+    def kavita_enabled(self) -> bool:
+        return self.manga_enabled and bool(self.kavita_url and self.kavita_api_key)
 
     @property
     def torrent_cleanup_enabled(self) -> bool:
@@ -240,6 +248,12 @@ class Settings:
         if not re.fullmatch(r"[\w .-]{1,60}", category):
             raise ConfigError("MANGA_CATEGORY must be a simple name like manga")
         nyaa = _url("NYAA_URL") or "https://nyaa.si"
+        kavita_url, kavita_key = _url("KAVITA_URL"), _text("KAVITA_API_KEY")
+        if kavita_url and not kavita_key:
+            raise ConfigError("KAVITA_URL needs KAVITA_API_KEY (Kavita: your account's settings -> Auth Keys)")
+        kavita_dir = _text("KAVITA_LIBRARY_DIR", "/manga") or "/manga"
+        if not kavita_dir.startswith("/") or ".." in kavita_dir.split("/"):
+            raise ConfigError("KAVITA_LIBRARY_DIR must be the folder as Kavita sees it, like /manga")
         return cls(
             discord_token=_token(),
             guild_id=_int("DISCORD_GUILD_ID"),
@@ -291,6 +305,9 @@ class Settings:
             manga_dir=_text("MANGA_DIR"),
             manga_reader_url=_url("MANGA_READER_URL"),
             nyaa_url=nyaa,
+            kavita_url=kavita_url,
+            kavita_api_key=kavita_key,
+            kavita_library_dir=kavita_dir.rstrip("/") or "/",
         )
 
     def page_url(self, kind: str, tmdb_id: int) -> str | None:

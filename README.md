@@ -290,6 +290,12 @@ the same pack, or delete one with its files. When a download is complete, the bo
    creates it). Mangas stop sharing as soon as they are complete (ratio limit 0).
 3. Optional `MANGA_READER_URL` for the links. In Kavita, switch on *Folder Watching* (Settings → Server), then new
    volumes show up without waiting for the nightly scan.
+4. Optional, so a volume is readable the moment it is loaded (Kavita's folder watching waits 10 minutes):
+   `KAVITA_URL` and `KAVITA_API_KEY`, an auth key of a Kavita admin (Kavita 0.9: Settings → Account →
+   *Auth Keys / OPDS*). When a download is complete, the bot asks Kavita to scan that folder, checks a few seconds
+   later that Kavita has the files, and only then sends the DM, with a link to the series. If Kavita doesn't show it
+   after a quarter of an hour, the DM says so. `KAVITA_LIBRARY_DIR` is the category's folder as Kavita sees it
+   (default `/manga`).
 
 Free space counts like for requests: below `MIN_FREE_GB` after the download, nothing is loaded, and the download
 brake pauses mangas too.
@@ -335,6 +341,8 @@ brake pauses mangas too.
 | `MANGA_DIR` | empty | Only to create that category: its save path as qBittorrent sees it |
 | `MANGA_READER_URL` | empty | Link to the reader (e.g. Kavita) in messages and in the panel |
 | `NYAA_URL` | `https://nyaa.si` | Where the torrent files of manga packs come from |
+| `KAVITA_URL`, `KAVITA_API_KEY` | empty | Kavita scans a finished manga right away; the DM waits until Kavita has it |
+| `KAVITA_LIBRARY_DIR` | `/manga` | The manga category's folder as Kavita sees it |
 
 ## Security
 

@@ -136,7 +136,8 @@ class Store:
         self.watch_asked: list[str] = []
         self.watch_questions: dict[int, WatchQuestion] = {}
         self.follows: dict[int, Follow] = {}  # /verfolgen
-        # /manga: torrents still loading → who gets told when they are done, and what it is
+        # /manga: torrents still loading → who gets told when they are done, and what it is; once loaded and Kavita
+        # was asked to scan: when ("scanned"), the torrent's name and its files as Kavita sees them ("paths")
         self.manga_pending: dict[str, dict[str, Any]] = {}
         self._load()
 
@@ -178,14 +179,29 @@ class Store:
         self.follows = {f.fid: f for f in _load_items(Follow, data.get("follows"))}
         manga = data.get("manga") if isinstance(data.get("manga"), dict) else {}
         pending = manga.get("pending") if isinstance(manga.get("pending"), dict) else {}
-        self.manga_pending = {str(k).lower(): {"label": str(v.get("label") or ""), "user_id": int(v.get("user_id") or 0),
-                                               "since": float(v.get("since") or 0)}
-                              for k, v in pending.items() if isinstance(v, dict) and str(v.get("user_id") or 0).isdigit()}
+        self.manga_pending = {}
+        for k, v in pending.items():
+            if not isinstance(v, dict) or not str(v.get("user_id") or 0).isdigit():
+                continue
+            wish = {"label": str(v.get("label") or ""), "user_id": int(v.get("user_id") or 0),
+                    "since": float(v.get("since") or 0)}
+            if v.get("scanned"):
+                paths = v.get("paths") if isinstance(v.get("paths"), list) else []
+                wish.update(scanned=float(v["scanned"]), name=str(v.get("name") or ""),
+                            paths=[str(p) for p in paths if isinstance(p, str)])
+            self.manga_pending[str(k).lower()] = wish
 
     def manga_wait(self, info_hash: str, label: str, user_id: int) -> None:
         """Somebody wants to know when this manga torrent is done (a second wish for it replaces the first)."""
         self.manga_pending[info_hash.lower()] = {"label": label, "user_id": user_id, "since": self._now()}
         self.save()
+
+    def manga_scanned(self, info_hash: str, name: str, paths: list[str]) -> None:
+        """The manga is loaded and Kavita scans it; the message waits until Kavita has it."""
+        wish = self.manga_pending.get(info_hash.lower())
+        if wish is not None:
+            wish.update(scanned=self._now(), name=name, paths=list(paths))
+            self.save()
 
     def manga_done(self, info_hash: str) -> dict[str, Any] | None:
         found = self.manga_pending.pop(info_hash.lower(), None)

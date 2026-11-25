@@ -8,6 +8,7 @@ from .core import GB
 from .discord_bot import SeerrBot
 from .jellyfin import JellyfinClient
 from .arr import ArrClient
+from .kavita import KavitaClient, ReaderSync
 from .manga import MangaService, MangaSource
 from .torrents import QbitClient, TorrentCleaner
 from .seerr import SeerrClient
@@ -36,11 +37,14 @@ def main() -> int:
         qbit = QbitClient(settings.qbittorrent_url, settings.qbittorrent_username, settings.qbittorrent_password)
     torrents = TorrentCleaner(qbit, arrs) if qbit is not None and settings.torrent_cleanup_enabled else None
     manga = None
+    reader = None
     if qbit is not None and settings.manga_enabled:
         manga = MangaService(MangaSource(settings.prowlarr_url, settings.prowlarr_api_key, settings.nyaa_url), qbit,
                              settings.manga_category, settings.manga_dir, settings.manga_reader_url)
-    SeerrBot(settings, seerr, jellyfin=jellyfin, torrents=torrents, arrs=arrs, qbit=qbit, manga=manga).run(
-        settings.discord_token, log_handler=None)
+        kavita = KavitaClient(settings.kavita_url, settings.kavita_api_key) if settings.kavita_enabled else None
+        reader = ReaderSync(manga, kavita, settings.kavita_library_dir)
+    SeerrBot(settings, seerr, jellyfin=jellyfin, torrents=torrents, arrs=arrs, qbit=qbit, manga=manga,
+             reader=reader).run(settings.discord_token, log_handler=None)
     return 0
 
 

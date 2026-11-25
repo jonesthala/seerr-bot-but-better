@@ -102,6 +102,7 @@ from .extras import (
 )
 from .manga import MangaError, MangaService, Release, overview_label, parse_selection, part_rows, selection_label, short_name
 from .manga import Part as MangaPart
+from .kavita import GIVE_UP_SECONDS, SCAN_WAIT, ReaderSync, series_link
 from .torrents import QbitClient, TorrentCleaner, TorrentError
 from .store import (FRIEND_APPROVED, FRIEND_DECLINED, FRIEND_PENDING, FRIEND_REVOKED, Approval, Friend, Store,
                     Follow, WatchQuestion)
@@ -215,7 +216,7 @@ class SeerrBot(discord.Client):
     def __init__(self, settings: Settings, seerr: SeerrClient, store: Store | None = None,
                  jellyfin: JellyfinClient | None = None, torrents: TorrentCleaner | None = None,
                  arrs: dict[str, ArrClient] | None = None, qbit: QbitClient | None = None,
-                 manga: MangaService | None = None) -> None:
+                 manga: MangaService | None = None, reader: ReaderSync | None = None) -> None:
         intents = discord.Intents.none()
         intents.guilds = True
         # Only the requester may be pinged, never @everyone or roles (titles come from TMDB).
@@ -228,6 +229,8 @@ class SeerrBot(discord.Client):
         self.arrs = arrs or {}  # "tv" → Sonarr, "movie" → Radarr: details in /status
         self.qbit = qbit  # speed and sources of running downloads in /status
         self.manga = manga  # None: no /manga (needs Prowlarr and qBittorrent)
+        # tells when a manga is loaded; with Kavita set up only once Kavita has scanned it
+        self.reader = reader if reader is not None or manga is None else ReaderSync(manga, None)
         self.store = store if store is not None else Store(settings.data_dir or None)
         self.tree = GuardedTree(self)
         self.space = SpaceWatch(settings.min_free_gb * GB)
@@ -537,20 +540,49 @@ class SeerrBot(discord.Client):
             return None
 
     async def check_manga(self) -> None:
-        """Tells whoever loaded a manga when all of it is there."""
-        if self.manga is None or not self.store.manga_pending:
+        """Tells whoever loaded a manga when all of it is there. With Kavita set up, Kavita scans it first and the
+        message waits until Kavita has the files (at most a quarter of an hour)."""
+        if self.reader is None or not self.store.manga_pending:
             return
-        for info_hash, name in await asyncio.to_thread(self.manga.finished, list(self.store.manga_pending)):
-            wish = self.store.manga_done(info_hash)
-            if wish is None or not name or not wish.get("user_id"):
-                continue
-            text = f"📚 **{escape(short_name(name))}**: {escape(wish['label'])} ist fertig geladen."
-            if self.settings.manga_reader_url:
-                text += f" Lesen: <{self.settings.manga_reader_url}>"
-            try:
-                await self.tell(int(wish["user_id"]), text)
-            except discord.HTTPException:
-                log.warning("Could not tell %s about the finished manga", wish["user_id"])
+        loading = [h for h, wish in self.store.manga_pending.items() if not wish.get("scanned")]
+        started = await asyncio.to_thread(self.reader.start, loading) if loading else []
+        for item in started:
+            if item.scanned:
+                self.store.manga_scanned(item.info_hash, item.name, item.paths)
+            else:
+                await self.tell_manga(item.info_hash, item.name)
+        if any(item.scanned for item in started):
+            await asyncio.sleep(SCAN_WAIT)  # Kavita scans in the background, a pack takes seconds
+        waiting = {h: wish.get("paths") or [] for h, wish in self.store.manga_pending.items() if wish.get("scanned")}
+        if not waiting:
+            return
+        seen = {s.info_hash: s for s in await asyncio.to_thread(self.reader.check, waiting)}
+        for info_hash in waiting:
+            wish = self.store.manga_pending.get(info_hash) or {}
+            found = seen.get(info_hash)
+            if found is not None and found.found:
+                await self.tell_manga(info_hash, str(wish.get("name") or ""), in_reader=True, series=found.series)
+            elif time.time() - float(wish.get("scanned") or 0) > GIVE_UP_SECONDS:
+                await self.tell_manga(info_hash, str(wish.get("name") or ""), late=True)
+
+    async def tell_manga(self, info_hash: str, name: str, in_reader: bool = False,
+                         series: tuple[int, int] | None = None, late: bool = False) -> None:
+        wish = self.store.manga_done(info_hash)
+        if wish is None or not name or not wish.get("user_id"):
+            return  # gone from qBittorrent, or nobody to tell
+        what = f"📚 **{escape(short_name(name))}**: {escape(wish['label'])}"
+        link = series_link(self.settings.manga_reader_url, series)
+        if in_reader:
+            text = f"{what} ist da und in Kavita." + (f" Lesen: <{link}>" if link else "")
+        elif late:
+            text = (f"{what} ist fertig geladen, aber Kavita zeigt es nach einer Viertelstunde noch nicht an. "
+                    "Im Zweifel in Kavita die Bibliothek scannen.") + (f" <{link}>" if link else "")
+        else:
+            text = f"{what} ist fertig geladen." + (f" Lesen: <{link}>" if link else "")
+        try:
+            await self.tell(int(wish["user_id"]), text)
+        except discord.HTTPException:
+            log.warning("Could not tell %s about the finished manga", wish["user_id"])
 
     async def check_brake(self) -> None:
         """Pauses the running downloads when the disk is nearly full, starts them again once there is room."""
