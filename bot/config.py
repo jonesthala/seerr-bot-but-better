@@ -137,6 +137,18 @@ class Settings:
     panel_todo_dir: str = ""  # optional: a folder of Markdown notes (e.g. an Obsidian vault), shown as a to-do page
     panel_todo_files: tuple[str, ...] = ()  # which notes, relative to that folder
     panel_obsidian_vault: str = ""  # vault name for "open in Obsidian" links
+    # /manga and the panel's manga page: search in Prowlarr, load with qBittorrent into a reader's folder (Kavita)
+    prowlarr_url: str = ""
+    prowlarr_api_key: str = ""
+    manga_category: str = "manga"  # qBittorrent category; its save path is the folder the reader watches
+    manga_dir: str = ""  # only needed if the bot should create the category: the save path as qBittorrent sees it
+    manga_reader_url: str = ""  # link to the reader, e.g. http://manga.home
+    nyaa_url: str = "https://nyaa.si"
+
+    @property
+    def manga_enabled(self) -> bool:
+        return bool(self.prowlarr_url and self.prowlarr_api_key and self.qbittorrent_url and self.qbittorrent_username
+                    and self.qbittorrent_password)
 
     @property
     def torrent_cleanup_enabled(self) -> bool:
@@ -221,6 +233,13 @@ class Settings:
         mc_url, mc_token = _url("PANEL_MC_URL"), _text("PANEL_MC_TOKEN")
         if mc_url and len(mc_token) < 32:
             raise ConfigError("PANEL_MC_URL needs PANEL_MC_TOKEN (the Minecraft bot's WEB_TOKEN, at least 32 characters)")
+        prowlarr_url, prowlarr_key = _url("PROWLARR_URL"), _text("PROWLARR_API_KEY")
+        if prowlarr_url and not prowlarr_key:
+            raise ConfigError("PROWLARR_URL needs PROWLARR_API_KEY (Prowlarr: Settings -> General -> API Key)")
+        category = _text("MANGA_CATEGORY", "manga") or "manga"
+        if not re.fullmatch(r"[\w .-]{1,60}", category):
+            raise ConfigError("MANGA_CATEGORY must be a simple name like manga")
+        nyaa = _url("NYAA_URL") or "https://nyaa.si"
         return cls(
             discord_token=_token(),
             guild_id=_int("DISCORD_GUILD_ID"),
@@ -266,6 +285,12 @@ class Settings:
             panel_todo_dir=todo_dir,
             panel_todo_files=todo_files,
             panel_obsidian_vault=_text("PANEL_OBSIDIAN_VAULT"),
+            prowlarr_url=prowlarr_url,
+            prowlarr_api_key=prowlarr_key,
+            manga_category=category,
+            manga_dir=_text("MANGA_DIR"),
+            manga_reader_url=_url("MANGA_READER_URL"),
+            nyaa_url=nyaa,
         )
 
     def page_url(self, kind: str, tmdb_id: int) -> str | None:

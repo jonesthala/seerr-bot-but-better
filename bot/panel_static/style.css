@@ -251,6 +251,15 @@ details.more summary:hover { color: var(--text); }
 .picker-sum { flex: 1; min-width: 200px; font-size: 13px; }
 .picker-sum strong { font-size: 14px; }
 
+/* --- manga --- */
+.manga-search { grid-template-columns: minmax(0, 1fr) auto; max-width: 760px; margin: 10px 0 14px; }
+.manga-hit { grid-template-columns: minmax(0, 1fr) auto; width: 100%; text-align: left; color: var(--text); font: inherit; cursor: pointer; }
+.manga-hit:hover { border-color: var(--line-strong); background: var(--surface-2); }
+.manga-parts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 220px), 1fr)); gap: 2px 8px; max-height: min(52vh, 540px); overflow: auto; overscroll-behavior: contain; }
+.manga-typed { flex-wrap: nowrap; }
+.manga-typed input { width: 150px; }
+.manga-free { margin-top: 10px; }
+
 /* --- brain to-dos --- */
 .todo-search { max-width: 440px; margin-bottom: 14px; }
 .todo-stand { margin-bottom: 12px; }

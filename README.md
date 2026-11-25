@@ -132,6 +132,7 @@ use `/folgen`, which talks to Sonarr directly.
   stop, players and RAM, backups, whitelist, console and logs.
 - Optional to-do page from your Markdown notes, e.g. an Obsidian vault: checklists and ideas by section, open or all,
   with a filter and "open in Obsidian" links. Read only.
+- Optional manga page (see [setup](#7-manga-optional)): search packs, tick volumes or chapters, load, add more, delete.
 - Log in with a Jellyfin administrator account. No extra password, nothing stored but a signed cookie.
 
 ## How it works
@@ -276,6 +277,23 @@ or a heading like `## ✅ Done` counts as done, `⭐` as a favourite. `PANEL_OBS
 For the Minecraft page, switch on the admin API of the Minecraft bot (`WEB_PORT`, `WEB_TOKEN` there) and set
 `PANEL_MC_URL` (e.g. `http://192.168.1.20:8096`) and `PANEL_MC_TOKEN` (the same token) here.
 
+### 7. Manga (optional)
+
+`/manga <titel>` and the panel's *Manga* page search manga packs in Prowlarr, show the volumes and chapters of a pack
+from its torrent file, and load only the ones you tick, with qBittorrent, into the folder a reader like
+[Kavita](https://www.kavitareader.com) watches. `/manga` without a title lists what is there: add more volumes from
+the same pack, or delete one with its files. When a download is complete, the bot sends a DM. Admins only.
+
+1. Prowlarr with a Nyaa indexer: `PROWLARR_URL` and `PROWLARR_API_KEY`. Only results with a Nyaa page are offered,
+   because their torrent file (and so the file list) can be read before loading.
+2. In qBittorrent a category `manga` whose save path is the reader's library folder (or set `MANGA_DIR`, then the bot
+   creates it). Mangas stop sharing as soon as they are complete (ratio limit 0).
+3. Optional `MANGA_READER_URL` for the links. In Kavita, switch on *Folder Watching* (Settings → Server), then new
+   volumes show up without waiting for the nightly scan.
+
+Free space counts like for requests: below `MIN_FREE_GB` after the download, nothing is loaded, and the download
+brake pauses mangas too.
+
 ## Settings
 
 | Variable | Default | Meaning |
@@ -312,6 +330,11 @@ For the Minecraft page, switch on the admin API of the Minecraft bot (`WEB_PORT`
 | `PANEL_MC_URL`, `PANEL_MC_TOKEN` | empty | Minecraft page: the Minecraft bot's admin API and its `WEB_TOKEN` |
 | `PANEL_TODO_DIR`, `PANEL_TODO_FILES` | empty | To-do page: a folder of Markdown notes and which notes to show |
 | `PANEL_OBSIDIAN_VAULT` | empty | Vault name for "open in Obsidian" links on the to-do page |
+| `PROWLARR_URL`, `PROWLARR_API_KEY` | empty | `/manga` and the panel's manga page (also needs `QBITTORRENT_*`) |
+| `MANGA_CATEGORY` | `manga` | qBittorrent category for mangas; its save path is the reader's library folder |
+| `MANGA_DIR` | empty | Only to create that category: its save path as qBittorrent sees it |
+| `MANGA_READER_URL` | empty | Link to the reader (e.g. Kavita) in messages and in the panel |
+| `NYAA_URL` | `https://nyaa.si` | Where the torrent files of manga packs come from |
 
 ## Security
 

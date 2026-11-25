@@ -136,6 +136,8 @@ class Store:
         self.watch_asked: list[str] = []
         self.watch_questions: dict[int, WatchQuestion] = {}
         self.follows: dict[int, Follow] = {}  # /verfolgen
+        # /manga: torrents still loading → who gets told when they are done, and what it is
+        self.manga_pending: dict[str, dict[str, Any]] = {}
         self._load()
 
     # --- file ------------------------------------------------------------------
@@ -174,6 +176,22 @@ class Store:
         self.watch_asked = [str(i) for i in watched.get("asked") or [] if isinstance(i, str)]
         self.watch_questions = {q.qid: q for q in _load_items(WatchQuestion, watched.get("questions"))}
         self.follows = {f.fid: f for f in _load_items(Follow, data.get("follows"))}
+        manga = data.get("manga") if isinstance(data.get("manga"), dict) else {}
+        pending = manga.get("pending") if isinstance(manga.get("pending"), dict) else {}
+        self.manga_pending = {str(k).lower(): {"label": str(v.get("label") or ""), "user_id": int(v.get("user_id") or 0),
+                                               "since": float(v.get("since") or 0)}
+                              for k, v in pending.items() if isinstance(v, dict) and str(v.get("user_id") or 0).isdigit()}
+
+    def manga_wait(self, info_hash: str, label: str, user_id: int) -> None:
+        """Somebody wants to know when this manga torrent is done (a second wish for it replaces the first)."""
+        self.manga_pending[info_hash.lower()] = {"label": label, "user_id": user_id, "since": self._now()}
+        self.save()
+
+    def manga_done(self, info_hash: str) -> dict[str, Any] | None:
+        found = self.manga_pending.pop(info_hash.lower(), None)
+        if found is not None:
+            self.save()
+        return found
 
     def save(self) -> None:
         if self.path is None:
@@ -190,6 +208,7 @@ class Store:
             "watched": {"since": self.watch_since, "asked": self.watch_asked,
                         "questions": [asdict(q) for q in self.watch_questions.values()]},
             "follows": [asdict(f) for f in self.follows.values()],
+            "manga": {"pending": self.manga_pending},
         }
         tmp = None
         try:

@@ -39,6 +39,7 @@
     checkSquare: '<rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8.5 12.5l2.5 2.5 5-6"/>',
     bulb: '<path d="M9 18h6M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/>',
     dot: '<circle cx="12" cy="12" r="2.5"/>',
+    book: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
   };
 
   function icon(name, cls = "i") {
@@ -293,6 +294,7 @@
     { id: "todos", label: "Brain-To-dos", icon: "checklist", render: renderTodos, need: "todos" },
     { id: "downloads", label: "Downloads", icon: "download", render: renderDownloads, need: "qbit" },
     { id: "suchen", label: "Suchen & holen", icon: "search", render: renderSearch },
+    { id: "manga", label: "Manga", icon: "book", render: renderManga, need: "manga" },
     { id: "kalender", label: "Kalender", icon: "calendar", render: renderCalendar, need: "tv" },
     { id: "verfolgt", label: "Verfolgt", icon: "follow", render: renderFollows, need: "tv" },
     { id: "minecraft", label: "Minecraft", icon: "cube", render: renderMinecraft, need: "mc" },
@@ -881,6 +883,231 @@
       onClose: () => {
         if (!fetched && data.added) api("/api/episodes/close", { body: { series_id: data.series_id } }).then((r) => toast(r && r.message)).catch(() => {});
       },
+    });
+  }
+
+  // --- Manga ---------------------------------------------------------------------------------------
+  const mangaState = { query: "", results: null };
+
+  function mangaRow(m, refresh) {
+    const paused = /paused|stopped/.test(m.state);
+    const [color, label] = m.done ? ["green", "da"] : paused ? ["amber", "pausiert"] : /stalled/.test(m.state) ? ["amber", "keine Quellen"] : ["blue", "lädt"];
+    const more = h("button", { class: "btn small", type: "button", disabled: m.count >= m.total, title: "Weitere Bände aus diesem Paket laden" }, icon("plus"), "Bände ergänzen");
+    more.onclick = () => openManga({ hash: m.hash }, refresh);
+    const del = h("button", { class: "btn small danger", type: "button", title: "Löschen", "aria-label": `${m.short} löschen` }, icon("trash"));
+    del.onclick = async () => {
+      if (!(await confirmBox("Löschen?", `**${m.short}** mit allen Dateien löschen (${size(m.size)})? Das lässt sich nicht rückgängig machen.`, "Löschen"))) return;
+      await run(null, () => api("/api/manga/delete", { body: { hash: m.hash } }), refresh);
+    };
+    const info = [m.done ? "fertig" : `${m.percent.toFixed(m.percent >= 100 ? 0 : 1)} %`];
+    if (!m.done && m.speed) info.push(speed(m.speed));
+    if (!m.done && m.eta) info.push(etaText(m.eta));
+    return h("div", { class: "torrent" },
+      h("div", null, h("div", { class: "torrent-name" }, m.short),
+        h("div", { class: "item-meta" }, h("span", { class: `pill ${color}` }, label), h("span", null, m.chosen), h("span", null, size(m.size)),
+          m.count < m.total ? h("span", null, `im Paket: ${m.all}`) : null)),
+      h("div", { class: "torrent-progress" }, bar(m.percent, m.done ? "green" : color === "amber" ? "amber" : "", true), h("span", null, info.join(" · "))),
+      h("div", { class: "row" }, more, del));
+  }
+
+  async function renderManga(token) {
+    const list = h("div", null, loadingRow());
+    const input = h("input", { type: "search", placeholder: "Manga suchen, am besten englisch, z.B. Tokyo Ghoul", value: mangaState.query, "aria-label": "Manga suchen", autocomplete: "off" });
+    const searchButton = h("button", { class: "btn primary", type: "button" }, icon("search"), "Suchen");
+    const results = h("div");
+    const reader = session.manga_reader ? h("a", { class: "btn ghost small", href: session.manga_reader, target: "_blank", rel: "noopener noreferrer" }, icon("book"), "Kavita öffnen") : null;
+
+    const refresh = async () => {
+      const data = await api("/api/manga");
+      if (token !== renderToken) return;
+      const parts = [];
+      if (data.brake.active) parts.push(banner("bad", `**Notbremse aktiv:** Downloads sind angehalten, bis wieder ${size(data.brake.resume_at)} frei sind.`));
+      parts.push(data.items.length ? h("div", { class: "torrents" }, data.items.map((m) => mangaRow(m, refresh)))
+        : empty("book", "Noch keine Mangas", "Unten suchen, ein Paket wählen, die Bände anhaken und laden."));
+      if (data.free !== null) parts.push(h("p", { class: "small muted manga-free" }, `Frei: ${size(data.free)}. Unter ${size(data.min_free)} lädt der Bot nichts mehr.`));
+      list.replaceChildren(...parts);
+    };
+    const drawResults = () => {
+      const found = mangaState.results;
+      if (found === null) {
+        results.replaceChildren();
+        return;
+      }
+      if (!found.length) {
+        results.replaceChildren(empty("search", "Nichts gefunden", "Den englischen Titel versuchen, oder ohne Untertitel."));
+        return;
+      }
+      results.replaceChildren(h("div", { class: "torrents" }, found.map((r) => h("button", { class: "torrent manga-hit", type: "button", onclick: () => openManga({ id: r.id, title: r.title }, refresh) },
+        h("div", null, h("div", { class: "torrent-name" }, r.title),
+          h("div", { class: "item-meta" }, r.have ? h("span", { class: "pill green" }, "schon da") : null, h("span", null, size(r.size)),
+            h("span", null, `${r.seeders} Quellen`), r.date ? h("span", null, r.date) : null)),
+        h("span", { class: "small muted nowrap" }, "Bände wählen")))));
+    };
+    const go = async () => {
+      const query = input.value.trim();
+      mangaState.query = query;
+      if (query.length < 2) {
+        mangaState.results = null;
+        drawResults();
+        return;
+      }
+      results.replaceChildren(loadingRow("Sucht in Prowlarr, das dauert ein paar Sekunden …"));
+      searchButton.disabled = true;
+      try {
+        const data = await api(`/api/manga/search?${new URLSearchParams({ q: query })}`);
+        if (token !== renderToken) return;
+        mangaState.results = data.results;
+        drawResults();
+      } catch (error) {
+        results.replaceChildren(banner("bad", error.message));
+      } finally {
+        searchButton.disabled = false;
+      }
+    };
+    searchButton.onclick = go;
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") go();
+    });
+    page.append(head("Manga", "Bände suchen und laden, gelesen wird in Kavita.", reader, refreshButton(refresh)),
+      section("Deine Mangas", list),
+      section("Suchen", h("p", { class: "small muted" }, "Klick auf ein Paket: Bände oder Kapitel anhaken, nur die werden geladen. «v01-20» heisst Band 1 bis 20, eine Zahl ohne v ist ein Kapitel."),
+        h("div", { class: "searchbar manga-search" }, input, searchButton), results));
+    drawResults();
+    await load(token, list, refresh);
+    every(8000, () => load(token, list, refresh, true));
+  }
+
+  // '10-14', 'Band 3, 5', 'Kapitel 100-120', 'alle' → the keys of the matching parts (null if not understood)
+  function pickParts(text, parts) {
+    const raw = text.trim().toLowerCase();
+    if (["alle", "alles", "all", "*"].includes(raw)) return parts.map((p) => p.key);
+    const fallback = parts.some((p) => p.kind === "band") ? "band" : "kapitel";
+    const keys = new Set();
+    for (const piece of raw.split(/[,;]|\bund\b/)) {
+      let token = piece.trim();
+      if (!token) continue;
+      let kind = fallback;
+      const prefix = token.match(/^(?:(bände|band|volume|vol|bd|b|v)|(kapitel|chapter|chap|kap|ch|c|k))(?=[\s.\d])\.?\s*/);
+      if (prefix) {
+        kind = prefix[1] ? "band" : "kapitel";
+        token = token.slice(prefix[0].length);
+      }
+      const range = token.match(/^(\d{1,4}(?:\.\d{1,2})?)(?:\s*[-–]\s*(\d{1,4}(?:\.\d{1,2})?))?$/);
+      if (!range) return null;
+      let low = Number(range[1]);
+      let high = range[2] ? Number(range[2]) : low;
+      if (high < low) [low, high] = [high, low];
+      for (const p of parts) {
+        if (p.kind === kind && p.number !== null && p.number <= high && (p.last ?? p.number) >= low) keys.add(p.key);
+      }
+    }
+    return [...keys];
+  }
+
+  async function openManga(source, after) {
+    openModal({ title: "Lädt …", body: loadingRow(source.hash ? "Lädt die Bände …" : "Holt die Dateiliste von Nyaa …"), wide: true });
+    let data;
+    try {
+      data = await api("/api/manga/open", { body: source });
+    } catch (error) {
+      openModal({ title: "Manga", body: banner("bad", error.message) });
+      return;
+    }
+    const chosen = new Set();
+    const byKey = new Map(data.parts.map((p) => [p.key, p]));
+    const list = h("div", { class: "manga-parts" });
+    const summary = h("div", { class: "picker-sum" });
+    const loadButton = h("button", { class: "btn primary", type: "button" }, icon("download"), "Laden");
+    let last = null;
+    let shift = false;
+
+    const drawSummary = () => {
+      const total = [...chosen].reduce((sum, key) => sum + byKey.get(key).size, 0);
+      const parts = [h("strong", null, chosen.size ? `${count(chosen.size, "Datei", "Dateien")} · ${size(total)}` : "Noch nichts ausgewählt")];
+      let tooBig = false;
+      if (data.free !== null) {
+        const afterLoad = data.free - total;
+        tooBig = chosen.size > 0 && afterLoad < data.min_free;
+        const line = h("div", { class: tooBig ? "" : "muted" }, `Frei ${size(data.free)}${chosen.size ? `, danach ${size(Math.max(afterLoad, 0))}` : ""}${tooBig ? `: zu wenig, unter ${size(data.min_free)} lädt der Bot nichts` : ""}`);
+        if (tooBig) line.style.color = "var(--red)";
+        parts.push(line);
+      }
+      summary.replaceChildren(...parts);
+      loadButton.disabled = !chosen.size || tooBig;
+    };
+    const drawList = () => list.replaceChildren(...data.parts.map((p, index) => {
+      const check = h("input", { type: "checkbox", checked: p.have || chosen.has(p.key), disabled: p.have, "aria-label": p.label });
+      const row = h("label", { class: `episode ${p.have ? "off" : ""} ${chosen.has(p.key) ? "selected" : ""}`, title: p.label }, check,
+        h("span", { class: "episode-name" }, p.label),
+        h("span", { class: `state ${p.have ? (p.percent >= 100 ? "have" : "loading") : ""}` }, p.have ? (p.percent >= 100 ? "da" : `lädt ${p.percent} %`) : size(p.size)));
+      check.addEventListener("click", (event) => { shift = event.shiftKey; });
+      check.addEventListener("change", () => {
+        if (shift && last !== null) {
+          const [from, to] = [Math.min(last, index), Math.max(last, index)];
+          for (const q of data.parts.slice(from, to + 1)) {
+            if (q.have) continue;
+            if (check.checked) chosen.add(q.key); else chosen.delete(q.key);
+          }
+          last = index;
+          drawList();
+        } else {
+          if (check.checked) chosen.add(p.key); else chosen.delete(p.key);
+          row.classList.toggle("selected", check.checked);
+          last = index;
+        }
+        drawSummary();
+      });
+      return row;
+    }));
+
+    const all = h("button", { class: "btn small", type: "button" }, "Alle");
+    all.onclick = () => { data.parts.filter((p) => !p.have).forEach((p) => chosen.add(p.key)); drawList(); drawSummary(); };
+    const none = h("button", { class: "btn ghost small", type: "button" }, "Keine");
+    none.onclick = () => { chosen.clear(); drawList(); drawSummary(); };
+    const typed = h("input", { placeholder: data.parts.some((p) => p.kind === "band") ? "z.B. 10-14" : "z.B. 100-120", "aria-label": "Bereich eintippen", maxlength: 200 });
+    const apply = h("button", { class: "btn small", type: "button" }, "Anhaken");
+    apply.onclick = () => {
+      const keys = pickParts(typed.value, data.parts);
+      if (keys === null) {
+        toast("Das verstehe ich nicht. Beispiele: 10-14, Band 3, Kapitel 100-120, alle.", "bad");
+        return;
+      }
+      const fresh = keys.filter((k) => !byKey.get(k).have);
+      if (!fresh.length) toast("Davon ist nichts mehr zu holen: schon da oder nicht im Paket.", "bad");
+      fresh.forEach((k) => chosen.add(k));
+      drawList();
+      drawSummary();
+    };
+    typed.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") apply.click();
+    });
+
+    loadButton.onclick = () => run(loadButton, async () => {
+      const body = data.mode === "new" ? { key: data.key, parts: [...chosen] } : { hash: data.hash, parts: [...chosen] };
+      const answer = await api("/api/manga/load", { body });
+      const reader = session.manga_reader ? h("a", { class: "btn", href: session.manga_reader, target: "_blank", rel: "noopener noreferrer" }, icon("book"), "Kavita öffnen") : null;
+      openModal({
+        title: data.short,
+        body: rich(answer.message, "rich result-text"),
+        foot: [h("div", { class: "grow" }), reader, h("button", { class: "btn primary", type: "button", onclick: closeModal }, "Fertig")],
+      });
+      if (after) after().catch(() => {});
+      return null;
+    });
+
+    const haveCount = data.parts.filter((p) => p.have).length;
+    const title = h("div", { class: "grow" }, h("h2", null, data.short),
+      h("div", { class: "small muted" }, `Im Paket: ${data.overview} · ${size(data.total)}${haveCount ? ` · ${haveCount} schon da` : ""}`));
+    drawList();
+    drawSummary();
+    openModal({
+      title,
+      wide: true,
+      body: h("div", { class: "stack" },
+        h("div", { class: "row" }, all, none, h("div", { class: "row manga-typed" }, typed, apply)),
+        h("p", { class: "small muted" }, "Tipp: Mit gedrückter Umschalttaste einen ganzen Bereich anhaken."),
+        list),
+      foot: [summary, h("button", { class: "btn ghost", type: "button", onclick: closeModal }, "Abbrechen"), loadButton],
     });
   }
 

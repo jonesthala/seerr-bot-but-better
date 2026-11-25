@@ -20,10 +20,11 @@ import discord
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
 
 from .arr import ArrError
-from .core import GB, REQUEST_PENDING, SeerrError, Title, declined_text
+from .core import GB, REQUEST_PENDING, SeerrError, Title, declined_text, size_text
 from .discord_bot import approved_text, escape, login_view
 from .extras import BRAKE_MARGIN, first_season_to_pick, parse_start, per_episode_estimate, plan_episodes, plan_lines
 from .jellyfin import JellyfinError
+from .manga import MangaError, Release, overview_label, part_rows, short_name
 from .notes import NotesError, read_notes
 from .panel import (
     SESSION_COOKIE,
@@ -150,7 +151,7 @@ class Panel:
                     log.info("Panel: %s %s by %s", request.method, path, request.get("user"))
             try:
                 response = await handler(request)
-            except (PanelError, SeerrError, ArrError, JellyfinError, NotesError) as error:
+            except (PanelError, SeerrError, ArrError, JellyfinError, NotesError, MangaError) as error:
                 response = web.json_response({"error": str(error)}, status=400)
             except web.HTTPException as error:
                 _secure(error)
@@ -188,6 +189,11 @@ class Panel:
             web.post("/api/follows/stop", self.follow_stop),
             web.get("/api/calendar", self.calendar),
             web.get("/api/todos", self.todos),
+            web.get("/api/manga", self.manga_list),
+            web.get("/api/manga/search", self.manga_search),
+            web.post("/api/manga/open", self.manga_open),
+            web.post("/api/manga/load", self.manga_load),
+            web.post("/api/manga/delete", self.manga_delete),
             web.route("*", "/api/mc/{tail:.+}", self.mc_proxy),
         ])
         return app
@@ -258,6 +264,8 @@ class Panel:
             "jellyfin": bot.jellyfin is not None,
             "discord_owner": self.owner is not None,
             "todos": bool(self.settings.panel_todo_dir),
+            "manga": bot.manga is not None,
+            "manga_reader": self.settings.manga_reader_url,
         })
 
     # --- overview ---------------------------------------------------------------------------
@@ -713,6 +721,104 @@ class Panel:
         if not self.settings.panel_todo_dir:
             raise PanelError("Die To-do-Seite ist nicht eingerichtet (PANEL_TODO_DIR).")
         return web.json_response(await asyncio.to_thread(self._notes))
+
+    # --- manga: search in Prowlarr, load chosen volumes with qBittorrent, read in Kavita ---------------
+    def _manga(self):
+        if self.bot.manga is None:
+            raise PanelError("Manga ist nicht eingerichtet (PROWLARR_URL und qBittorrent).")
+        return self.bot.manga
+
+    def _space(self, free: int | None) -> dict[str, Any]:
+        return {"free": free, "min_free": self.settings.min_free_gb * GB, "brake": self.brake_info()}
+
+    async def manga_list(self, request: web.Request) -> web.Response:
+        manga = self._manga()
+        items = await asyncio.to_thread(manga.items)
+        for item in items:
+            item["short"] = short_name(item["name"])
+        free = await asyncio.to_thread(self.bot.seerr.free_bytes)
+        return web.json_response({"items": items, "reader": self.settings.manga_reader_url, **self._space(free)})
+
+    async def manga_search(self, request: web.Request) -> web.Response:
+        manga = self._manga()
+        releases = await asyncio.to_thread(manga.search, request.query.get("q", ""))
+        have = {t.get("hash", "").lower() for t in await asyncio.to_thread(manga.qbit.torrents_in, manga.category)}
+        return web.json_response({"results": [{
+            "id": r.nyaa_id, "title": r.title, "short": short_name(r.title), "size": r.size, "seeders": r.seeders,
+            "leechers": r.leechers, "date": r.published, "have": bool(r.info_hash) and r.info_hash in have,
+        } for r in releases]})
+
+    async def _picker(self, info_hash: str) -> dict[str, Any]:
+        torrent, parts, by_path = await asyncio.to_thread(self._manga().manga, info_hash)
+        return {"mode": "more", "hash": info_hash, "title": str(torrent.get("name") or "?"),
+                "parts": part_rows(parts, by_path), "overview": overview_label(parts), "total": sum(p.size for p in parts)}
+
+    async def manga_open(self, request: web.Request) -> web.Response:
+        """The parts of a search result (fetches its torrent file) or of a manga that is there, to pick from."""
+        manga = self._manga()
+        data = await _body(request)
+        if data.get("hash") is not None:
+            info_hash = str(data.get("hash")).lower()
+            if not _HASH_RE.match(info_hash):
+                raise PanelError("Die Anfrage ist ungültig.")
+            answer = await self._picker(info_hash)
+        else:
+            release = Release(_whole(data, "id"), _text(data, "title", 300) or "?", 0, 0, 0, "", "")
+            key, prepared = await asyncio.to_thread(manga.prepare, release)
+            info_hash = prepared.torrent.info_hash
+            if await asyncio.to_thread(manga.existing, info_hash) is not None:
+                answer = await self._picker(info_hash)
+            else:
+                answer = {"mode": "new", "key": key, "title": release.title, "parts": part_rows(prepared.parts),
+                          "overview": overview_label(prepared.parts), "total": sum(p.size for p in prepared.parts)}
+        answer["short"] = short_name(answer["title"])
+        answer.update(self._space(await asyncio.to_thread(self.bot.seerr.free_bytes)))
+        return web.json_response(answer)
+
+    async def manga_load(self, request: web.Request) -> web.Response:
+        manga = self._manga()
+        data = await _body(request)
+        chosen = number_list(data.get("parts"), 2000)
+        if not chosen:
+            raise PanelError("Ausgewählt ist nichts.")
+        key, info_hash = data.get("key"), data.get("hash")
+        if isinstance(info_hash, str) and _HASH_RE.match(info_hash.lower()):
+            mode = "more"
+        elif isinstance(key, str) and re.fullmatch(r"[0-9a-f]{32}", key):
+            mode = "new"
+        else:
+            raise PanelError("Die Anfrage ist ungültig.")
+        if mode == "more":
+            _, parts, by_path = await asyncio.to_thread(manga.manga, info_hash.lower())
+            rows = part_rows(parts, by_path)
+            size = sum(parts[i].size for i in set(chosen) if 0 <= i < len(parts) and not rows[i]["have"])
+        else:
+            parts = manga.prepared(key).parts
+            size = sum(parts[i].size for i in set(chosen) if 0 <= i < len(parts))
+        free = await asyncio.to_thread(self.bot.seerr.free_bytes)
+        if free is not None and free - size < self.settings.min_free_gb * GB:
+            raise PanelError(f"Zu wenig Platz: frei sind {size_text(free)}, nach dem Laden wären es "
+                             f"{size_text(max(free - size, 0))}. Unter {self.settings.min_free_gb} GB lädt der Bot nichts.")
+        if mode == "more":
+            info_hash, what, size = await asyncio.to_thread(manga.extend, info_hash.lower(), chosen)
+        else:
+            info_hash, what, size = await asyncio.to_thread(manga.add, key, chosen)
+        if self.owner is not None:
+            self.bot.store.manga_wait(info_hash, what, self.owner)
+        text = f"⏬ **{what}** ({size_text(size)}) wird geladen."
+        text += " Wenn alles da ist, schreibt dir der Bot im Discord." if self.owner is not None else ""
+        if self.bot.store.brake_active:
+            text += "\nDie Notbremse ist aktiv: Es geht erst weiter, wenn wieder genug Platz frei ist."
+        return web.json_response({"message": text, "hash": info_hash})
+
+    async def manga_delete(self, request: web.Request) -> web.Response:
+        manga = self._manga()
+        info_hash = str((await _body(request)).get("hash") or "").lower()
+        if not _HASH_RE.match(info_hash):
+            raise PanelError("Die Anfrage ist ungültig.")
+        name, size = await asyncio.to_thread(manga.delete, info_hash)
+        self.bot.store.manga_done(info_hash)
+        return web.json_response({"message": f"🗑️ **{short_name(name)}** gelöscht, {size_text(size)} frei geworden."})
 
     # --- Minecraft: passed on to the Minecraft bot's admin API ----------------------------------
     async def mc_proxy(self, request: web.Request) -> web.Response:

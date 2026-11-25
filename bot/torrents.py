@@ -11,6 +11,7 @@ import logging
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Callable
 
 from .arr import ArrClient, ArrError
@@ -46,7 +47,8 @@ class QbitClient:
         self._fetch = fetch
         self._sid: str | None = None
 
-    def _send(self, method: str, path: str, form: dict[str, str] | None = None) -> tuple[int, dict[str, str], bytes]:
+    def _send(self, method: str, path: str, form: dict[str, str] | None = None,
+              raw: tuple[str, bytes] | None = None) -> tuple[int, dict[str, str], bytes]:
         headers = {"Referer": self.base_url, "Origin": self.base_url, "User-Agent": USER_AGENT}
         if self._sid:
             headers["Cookie"] = f"SID={self._sid}"
@@ -54,6 +56,8 @@ class QbitClient:
         if form is not None:
             headers["Content-Type"] = "application/x-www-form-urlencoded"
             body = urllib.parse.urlencode(form).encode()
+        elif raw is not None:
+            headers["Content-Type"], body = raw
         try:
             return self._fetch(method, f"{self.base_url}/api/v2{path}", headers, body)
         except Exception as exc:  # noqa: BLE001 - timeouts, refused
@@ -72,13 +76,14 @@ class QbitClient:
                                "`QBITTORRENT_USERNAME` und `QBITTORRENT_PASSWORD` prüfen.")
         self._sid = sid.strip()
 
-    def _call(self, method: str, path: str, form: dict[str, str] | None = None) -> bytes:
+    def _call(self, method: str, path: str, form: dict[str, str] | None = None,
+              raw: tuple[str, bytes] | None = None) -> bytes:
         if self._sid is None:
             self._login()
-        status, _, body = self._send(method, path, form)
+        status, _, body = self._send(method, path, form, raw)
         if status == 403:  # session expired
             self._login()
-            status, _, body = self._send(method, path, form)
+            status, _, body = self._send(method, path, form, raw)
         if not 200 <= status < 300:
             raise TorrentError(f"qBittorrent meldet einen Fehler (HTTP {status}).")
         return body
@@ -119,6 +124,52 @@ class QbitClient:
     def delete(self, hashes: list[str]) -> None:
         """Removes the torrents and their files."""
         self._call("POST", "/torrents/delete", {"hashes": "|".join(hashes), "deleteFiles": "true"})
+
+    # --- for /manga: own torrents with only some of their files ---
+    def torrents_in(self, category: str) -> list[dict]:
+        return self._torrent_list(self._call("GET", "/torrents/info?" + urllib.parse.urlencode({"category": category})))
+
+    def files(self, info_hash: str) -> list[dict]:
+        """The files of a torrent with index, name, size, progress and priority (0 = not loaded)."""
+        try:
+            data = json.loads(self._call("GET", "/torrents/files?" + urllib.parse.urlencode({"hash": info_hash})))
+        except ValueError:
+            return []
+        except TorrentError as error:
+            if "HTTP 404" in str(error):
+                return []
+            raise
+        return [f for f in data if isinstance(f, dict)] if isinstance(data, list) else []
+
+    def file_priority(self, info_hash: str, ids: list[str], priority: int) -> None:
+        for start in range(0, len(ids), 500):
+            self._call("POST", "/torrents/filePrio",
+                       {"hash": info_hash, "id": "|".join(ids[start:start + 500]), "priority": str(priority)})
+
+    def categories(self) -> dict[str, dict]:
+        try:
+            data = json.loads(self._call("GET", "/torrents/categories"))
+        except ValueError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def create_category(self, name: str, save_path: str) -> None:
+        self._call("POST", "/torrents/createCategory", {"category": name, "savePath": save_path})
+
+    def add_torrent(self, data: bytes, filename: str, category: str) -> None:
+        """Adds a .torrent file paused, in the category, and stops sharing as soon as it is complete (ratio 0)."""
+        boundary = f"----seerrbot{uuid.uuid4().hex}"
+        fields = {"category": category, "paused": "true", "stopped": "true", "ratioLimit": "0",
+                  "seedingTimeLimit": "0"}  # "stopped" is qBittorrent 5's name for "paused"
+        parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode()
+                 for key, value in fields.items()]
+        safe = "".join(c for c in filename if c.isalnum() or c in "._-") or "manga.torrent"
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="torrents"; filename="{safe}"\r\n'
+                     "Content-Type: application/x-bittorrent\r\n\r\n".encode() + data + b"\r\n")
+        body = b"".join(parts) + f"--{boundary}--\r\n".encode()
+        answer = self._call("POST", "/torrents/add", raw=(f"multipart/form-data; boundary={boundary}", body))
+        if answer.strip() == b"Fails.":
+            raise TorrentError("qBittorrent hat den Torrent abgelehnt.")
 
 
 class TorrentCleaner:

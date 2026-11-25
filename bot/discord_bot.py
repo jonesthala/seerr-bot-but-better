@@ -100,6 +100,8 @@ from .extras import (
     watched_questions,
     watched_text,
 )
+from .manga import MangaError, MangaService, Release, overview_label, parse_selection, part_rows, selection_label, short_name
+from .manga import Part as MangaPart
 from .torrents import QbitClient, TorrentCleaner, TorrentError
 from .store import (FRIEND_APPROVED, FRIEND_DECLINED, FRIEND_PENDING, FRIEND_REVOKED, Approval, Friend, Store,
                     Follow, WatchQuestion)
@@ -178,7 +180,7 @@ async def report_error(interaction: discord.Interaction, error: BaseException) -
         message = str(error)
     elif isinstance(error, app_commands.CheckFailure):
         message = "🔒 Das darfst du hier nicht."
-    elif isinstance(error, (SeerrError, JellyfinError, TorrentError, ArrError)):
+    elif isinstance(error, (SeerrError, JellyfinError, TorrentError, ArrError, MangaError)):
         message = f"⚠️ {error}"
     else:
         log.error("Interaction failed", exc_info=error)
@@ -212,7 +214,8 @@ class GuardedTree(app_commands.CommandTree):
 class SeerrBot(discord.Client):
     def __init__(self, settings: Settings, seerr: SeerrClient, store: Store | None = None,
                  jellyfin: JellyfinClient | None = None, torrents: TorrentCleaner | None = None,
-                 arrs: dict[str, ArrClient] | None = None, qbit: QbitClient | None = None) -> None:
+                 arrs: dict[str, ArrClient] | None = None, qbit: QbitClient | None = None,
+                 manga: MangaService | None = None) -> None:
         intents = discord.Intents.none()
         intents.guilds = True
         # Only the requester may be pinged, never @everyone or roles (titles come from TMDB).
@@ -224,6 +227,7 @@ class SeerrBot(discord.Client):
         self.torrents = torrents  # None: /löschen leaves the torrents in qBittorrent
         self.arrs = arrs or {}  # "tv" → Sonarr, "movie" → Radarr: details in /status
         self.qbit = qbit  # speed and sources of running downloads in /status
+        self.manga = manga  # None: no /manga (needs Prowlarr and qBittorrent)
         self.store = store if store is not None else Store(settings.data_dir or None)
         self.tree = GuardedTree(self)
         self.space = SpaceWatch(settings.min_free_gb * GB)
@@ -356,7 +360,7 @@ class SeerrBot(discord.Client):
     @tasks.loop(minutes=WATCH_MINUTES)
     async def watch_loop(self) -> None:
         for check, what in ((self.sync_approvals, "Approval"), (self.check_requests, "Request"),
-                            (self.load_profiles, "Profile")):
+                            (self.load_profiles, "Profile"), (self.check_manga, "Manga")):
             try:
                 await check()
             except Exception:  # noqa: BLE001 - the loop must keep running
@@ -524,6 +528,29 @@ class SeerrBot(discord.Client):
     def jellyfin_link(self, item_id: str) -> str | None:
         base = self.settings.jellyfin_url or self.settings.jellyfin_friend_url or self.settings.jellyfin_api_url
         return f"{base.rstrip('/')}/web/index.html#!/details?id={item_id}" if base else None
+
+    async def free_or_none(self) -> int | None:
+        """Free space for an estimate; None if Seerr can't say."""
+        try:
+            return await asyncio.to_thread(self.seerr.free_bytes)
+        except Exception:  # noqa: BLE001 - only for the estimate
+            return None
+
+    async def check_manga(self) -> None:
+        """Tells whoever loaded a manga when all of it is there."""
+        if self.manga is None or not self.store.manga_pending:
+            return
+        for info_hash, name in await asyncio.to_thread(self.manga.finished, list(self.store.manga_pending)):
+            wish = self.store.manga_done(info_hash)
+            if wish is None or not name or not wish.get("user_id"):
+                continue
+            text = f"📚 **{escape(short_name(name))}**: {escape(wish['label'])} ist fertig geladen."
+            if self.settings.manga_reader_url:
+                text += f" Lesen: <{self.settings.manga_reader_url}>"
+            try:
+                await self.tell(int(wish["user_id"]), text)
+            except discord.HTTPException:
+                log.warning("Could not tell %s about the finished manga", wish["user_id"])
 
     async def check_brake(self) -> None:
         """Pauses the running downloads when the disk is nearly full, starts them again once there is room."""
@@ -1935,6 +1962,361 @@ class RandomPick(discord.ui.View):
             await interaction.edit_original_response(embed=embed, view=self)
 
 
+# --- manga -------------------------------------------------------------------------
+MANGA_COLOR = discord.Color.from_rgb(232, 121, 249)
+
+
+def reader_button(bot: SeerrBot) -> discord.ui.Button | None:
+    url = bot.settings.manga_reader_url
+    return discord.ui.Button(style=discord.ButtonStyle.link, label="In Kavita lesen", emoji="📖", url=url) if url else None
+
+
+class MangaView(discord.ui.View):
+    """One admin's manga message: only they may click, after a while the buttons go."""
+
+    def __init__(self, bot: SeerrBot, owner: discord.abc.User) -> None:
+        super().__init__(timeout=PICK_TIMEOUT * 2)
+        self.bot = bot
+        self.owner = owner
+        self.message: discord.Message | discord.WebhookMessage | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner.id:
+            return True
+        await interaction.response.send_message(NOT_YOURS, ephemeral=True)
+        return False
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        await report_error(interaction, error)
+
+    async def on_timeout(self) -> None:
+        if self.message is not None:
+            try:
+                await self.message.edit(view=None)
+            except discord.HTTPException:
+                pass
+
+    async def open_picker(self, interaction: discord.Interaction, picker: "MangaPicker") -> None:
+        self.stop()
+        picker.message = self.message
+        await interaction.edit_original_response(content=None, embed=picker.embed(), view=picker)
+
+
+class MangaSearch(MangaView):
+    """Search results: pick a pack, then its volumes."""
+
+    def __init__(self, bot: SeerrBot, owner: discord.abc.User, query: str, releases: list[Release],
+                 preset: str | None) -> None:
+        super().__init__(bot, owner)
+        self.query = query
+        self.releases = releases
+        self.preset = preset
+        select = discord.ui.Select(placeholder="Paket wählen", options=[
+            discord.SelectOption(label=shorten(r.title, 100), value=str(i),
+                                 description=shorten(f"{size_text(r.size)} · {r.seeders} Quellen · {r.published}", 100))
+            for i, r in enumerate(releases[:25])])
+        select.callback = self.chosen
+        self.add_item(select)
+        self.select = select
+
+    def embed(self) -> discord.Embed:
+        lines = [f"`{i + 1:>2}` **{escape(shorten(r.title, 110))}**\n-# {size_text(r.size)} · {r.seeders} Quellen"
+                 + (f" · {r.published}" if r.published else "") for i, r in enumerate(self.releases)]
+        embed = discord.Embed(title=f"📚 Manga: {escape(shorten(self.query, 80))}", description="\n".join(lines)[:4000],
+                              color=MANGA_COLOR)
+        embed.set_footer(text="Paket wählen, dann die Bände. «v01-20» heisst Band 1 bis 20, eine Zahl ohne v ist ein Kapitel.")
+        return embed
+
+    async def chosen(self, interaction: discord.Interaction) -> None:
+        release = self.releases[int(self.select.values[0])]
+        await interaction.response.edit_message(content=f"⏳ Hole die Dateiliste von **{escape(shorten(release.title, 80))}** …",
+                                                embed=None, view=None)
+        manga = self.bot.manga
+        key, prepared = await asyncio.to_thread(manga.prepare, release)
+        torrent = await asyncio.to_thread(manga.existing, prepared.torrent.info_hash)
+        if torrent is not None:
+            _, parts, by_path = await asyncio.to_thread(manga.manga, prepared.torrent.info_hash)
+            picker = MangaPicker(self.bot, self.owner, prepared.torrent.name, parts, by_path,
+                                 info_hash=prepared.torrent.info_hash)
+        else:
+            picker = MangaPicker(self.bot, self.owner, release.title, prepared.parts, None, key=key)
+        picker.free = await self.bot.free_or_none()
+        if self.preset:
+            picker.apply(self.preset)
+        picker.render()
+        await self.open_picker(interaction, picker)
+
+
+class MangaSelectForm(discord.ui.Modal, title="Welche Bände oder Kapitel?"):
+    def __init__(self, picker: "MangaPicker") -> None:
+        super().__init__()
+        self.picker = picker
+        self.answer = discord.ui.TextInput(label="Auswahl", placeholder="z.B. 10-14, Kapitel 100-120 oder alle",
+                                           max_length=200, default=picker.typed or None)
+        self.add_item(self.answer)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        self.picker.apply(str(self.answer.value))
+        self.picker.render()
+        await interaction.response.edit_message(embed=self.picker.embed(), view=self.picker)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await report_error(interaction, error)
+
+
+class MangaPicker(MangaView):
+    """The volumes and chapters of one pack, to tick and load; for a manga that is there, to add more."""
+
+    def __init__(self, bot: SeerrBot, owner: discord.abc.User, title: str, parts: list[MangaPart],
+                 by_path: dict[str, dict] | None, key: str = "", info_hash: str = "") -> None:
+        super().__init__(bot, owner)
+        self.title = title
+        self.parts = parts
+        self.key = key  # a new pack (prepared torrent) …
+        self.info_hash = info_hash  # … or one that is in qBittorrent already
+        rows = part_rows(parts, by_path)
+        self.have = {r["key"] for r in rows if r["have"]}
+        self.chosen: set[int] = set()
+        self.free: int | None = None
+        self.typed = ""
+        self.problem = ""
+        self.render()
+
+    @property
+    def open_keys(self) -> list[int]:
+        return [i for i in range(len(self.parts)) if i not in self.have]
+
+    def apply(self, text: str) -> None:
+        self.typed = text.strip()
+        try:
+            self.chosen = {i for i in parse_selection(text, self.parts) if i not in self.have}
+            self.problem = "" if self.chosen else "Das ist schon alles da."
+        except ValueError as error:
+            self.problem = str(error)
+
+    @property
+    def size(self) -> int:
+        return sum(self.parts[i].size for i in self.chosen)
+
+    @property
+    def too_big(self) -> bool:
+        return self.free is not None and self.free - self.size < self.bot.settings.min_free_gb * GB
+
+    def render(self) -> None:
+        self.clear_items()
+        keys = self.open_keys
+        if 0 < len(keys) <= 25:
+            select = discord.ui.Select(placeholder="Bände/Kapitel anklicken", min_values=0, max_values=len(keys), row=0,
+                                       options=[discord.SelectOption(label=shorten(self.parts[i].label, 100), value=str(i),
+                                                                     description=size_text(self.parts[i].size),
+                                                                     default=i in self.chosen) for i in keys])
+
+            async def picked(interaction: discord.Interaction) -> None:
+                self.chosen = {int(v) for v in select.values}
+                self.problem = ""
+                self.render()
+                await interaction.response.edit_message(embed=self.embed(), view=self)
+            select.callback = picked
+            self.add_item(select)
+        buttons = [("Alle", discord.ButtonStyle.secondary, self.all, not keys),
+                   ("Eintippen …", discord.ButtonStyle.secondary, self.type_in, not keys),
+                   ("Laden", discord.ButtonStyle.success, self.load, not self.chosen or self.too_big),
+                   ("Abbrechen", discord.ButtonStyle.secondary, self.cancel, False)]
+        for label, style, callback, disabled in buttons:
+            button = discord.ui.Button(label=label, style=style, disabled=disabled, row=1)
+            button.callback = callback
+            self.add_item(button)
+
+    def embed(self) -> discord.Embed:
+        lines = [f"**Im Paket:** {escape(overview_label(self.parts))} ({size_text(sum(p.size for p in self.parts))})"]
+        if self.have:
+            lines.append(f"**Schon da oder lädt:** {escape(selection_label([self.parts[i] for i in sorted(self.have)]))}")
+        if self.chosen:
+            lines.append(f"**Ausgewählt:** {escape(selection_label([self.parts[i] for i in sorted(self.chosen)]))}"
+                         f" · {size_text(self.size)}")
+        else:
+            lines.append("**Ausgewählt:** noch nichts")
+        if len(self.open_keys) > 25:
+            lines.append("-# Zu viele zum Anklicken: «Eintippen …» und z.B. `10-14`, `Kapitel 100-120` oder `alle`.")
+        if self.problem:
+            lines.append(f"⚠️ {escape(self.problem)}")
+        if self.free is not None:
+            after = self.free - self.size
+            line = f"Frei {size_text(self.free)}" + (f", danach {size_text(max(after, 0))}" if self.chosen else "")
+            if self.chosen and self.too_big:
+                line += f". ⚠️ Zu viel: unter {self.bot.settings.min_free_gb} GB frei lädt der Bot nichts mehr."
+            lines.append(f"-# {line}")
+        embed = discord.Embed(title=f"📚 {escape(shorten(short_name(self.title), 200))}", description="\n".join(lines)[:4000],
+                              color=MANGA_COLOR)
+        embed.set_footer(text=shorten(self.title, 200))
+        return embed
+
+    async def all(self, interaction: discord.Interaction) -> None:
+        self.chosen = set(self.open_keys)
+        self.problem = ""
+        self.render()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def type_in(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(MangaSelectForm(self))
+
+    async def cancel(self, interaction: discord.Interaction) -> None:
+        self.stop()
+        await interaction.response.edit_message(content="Abgebrochen, nichts geladen.", embed=None, view=None)
+
+    async def load(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        manga = self.bot.manga
+        self.free = await self.bot.free_or_none()
+        if self.too_big:
+            self.render()
+            await interaction.edit_original_response(embed=self.embed(), view=self)
+            return
+        chosen = sorted(self.chosen)
+        if self.info_hash:
+            info_hash, what, size = await asyncio.to_thread(manga.extend, self.info_hash, chosen)
+        else:
+            info_hash, what, size = await asyncio.to_thread(manga.add, self.key, chosen)
+        self.bot.store.manga_wait(info_hash, what, self.owner.id)
+        self.stop()
+        text = (f"⏬ **{escape(short_name(self.title))}**: {escape(what)} ({size_text(size)}) wird geladen. "
+                "Wenn alles da ist, schreibt dir der Bot.")
+        if self.bot.store.brake_active:
+            text += "\n⚠️ Die Notbremse ist aktiv: Es geht erst weiter, wenn wieder genug Platz frei ist."
+        link = reader_button(self.bot)
+        view = None
+        if link is not None:
+            view = discord.ui.View(timeout=None)
+            view.add_item(link)
+        await interaction.edit_original_response(content=text, embed=None, view=view)
+
+
+class MangaList(MangaView):
+    """The mangas in qBittorrent: add volumes or delete one."""
+
+    def __init__(self, bot: SeerrBot, owner: discord.abc.User, items: list[dict]) -> None:
+        super().__init__(bot, owner)
+        self.items = items
+        self.current: dict | None = None
+        self.confirm = False
+        self.render()
+
+    def render(self) -> None:
+        self.clear_items()
+        if self.items:
+            select = discord.ui.Select(placeholder="Manga wählen", row=0, options=[
+                discord.SelectOption(label=shorten(short_name(m["name"]), 100), value=m["hash"],
+                                     description=shorten(f"{m['chosen']} · {size_text(m['size'])}", 100),
+                                     default=self.current is not None and m["hash"] == self.current["hash"])
+                for m in self.items[:25]])
+
+            async def picked(interaction: discord.Interaction) -> None:
+                self.current = next(m for m in self.items if m["hash"] == select.values[0])
+                self.confirm = False
+                self.render()
+                await interaction.response.edit_message(embed=self.embed(), view=self)
+            select.callback = picked
+            self.add_item(select)
+        if self.current is not None and not self.confirm:
+            more = discord.ui.Button(label="Bände ergänzen", style=discord.ButtonStyle.primary, row=1,
+                                     disabled=self.current["count"] >= self.current["total"])
+            more.callback = self.more
+            delete = discord.ui.Button(label="Löschen", style=discord.ButtonStyle.danger, row=1)
+            delete.callback = self.ask_delete
+            self.add_item(more)
+            self.add_item(delete)
+        elif self.current is not None:
+            yes = discord.ui.Button(label="Ja, mit Dateien löschen", style=discord.ButtonStyle.danger, row=1)
+            yes.callback = self.delete
+            back = discord.ui.Button(label="Doch nicht", style=discord.ButtonStyle.secondary, row=1)
+            back.callback = self.back
+            self.add_item(yes)
+            self.add_item(back)
+        link = reader_button(self.bot)
+        if link is not None:
+            link.row = 2
+            self.add_item(link)
+
+    def embed(self) -> discord.Embed:
+        if not self.items:
+            return discord.Embed(title="📚 Deine Mangas", color=MANGA_COLOR,
+                                 description="Noch keine. Suchen und laden: `/manga titel:Tokyo Ghoul`")
+        lines = []
+        for m in self.items:
+            state = "✅ da" if m["done"] else f"⏬ {m['percent']:.0f} %"
+            lines.append(f"**{escape(short_name(m['name']))}** · {escape(m['chosen'])} · {size_text(m['size'])} · {state}")
+        embed = discord.Embed(title="📚 Deine Mangas", description="\n".join(lines)[:4000], color=MANGA_COLOR)
+        if self.current is not None and self.confirm:
+            embed.add_field(name="Wirklich löschen?", inline=False,
+                            value=f"**{escape(short_name(self.current['name']))}** mit allen Dateien "
+                                  f"({size_text(self.current['size'])}). Das lässt sich nicht rückgängig machen.")
+        elif self.current is not None:
+            embed.add_field(name=shorten(short_name(self.current["name"]), 250), inline=False,
+                            value=f"Da: {escape(self.current['chosen'])}\nIm Paket: {escape(self.current['all'])}")
+        embed.set_footer(text="Neue Mangas: /manga titel:… · Kavita zeigt neue Bände von selbst")
+        return embed
+
+    async def more(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        torrent, parts, by_path = await asyncio.to_thread(self.bot.manga.manga, self.current["hash"])
+        picker = MangaPicker(self.bot, self.owner, str(torrent.get("name") or "?"), parts, by_path,
+                             info_hash=self.current["hash"])
+        picker.free = await self.bot.free_or_none()
+        picker.render()
+        await self.open_picker(interaction, picker)
+
+    async def ask_delete(self, interaction: discord.Interaction) -> None:
+        self.confirm = True
+        self.render()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def back(self, interaction: discord.Interaction) -> None:
+        self.confirm = False
+        self.render()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def delete(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        name, size = await asyncio.to_thread(self.bot.manga.delete, self.current["hash"])
+        self.bot.store.manga_done(self.current["hash"])
+        self.items = [m for m in self.items if m["hash"] != self.current["hash"]]
+        self.current, self.confirm = None, False
+        self.render()
+        embed = self.embed()
+        embed.description = f"🗑️ **{escape(short_name(name))}** gelöscht, {size_text(size)} frei geworden.\n\n" + (
+            embed.description or "")
+        await interaction.edit_original_response(embed=embed, view=self)
+
+
+def manga_commands(bot: SeerrBot) -> list[app_commands.Command]:
+    """/manga for admins, if Prowlarr and qBittorrent are set up."""
+    def only_admin(interaction: discord.Interaction) -> bool:
+        if bot.is_admin(interaction):
+            return True
+        raise NotAllowed(NO_FRIEND_ADMIN)
+
+    @app_commands.command(name="manga", description="Manga suchen und Bände laden; ohne Titel: deine Mangas ergänzen oder löschen (nur Admins)")
+    @app_commands.describe(titel="Name des Mangas, am besten englisch, z.B. Tokyo Ghoul. Leer lassen: was schon da ist",
+                           auswahl="Gleich vorwählen, z.B. 10-14, Kapitel 100-120 oder alle")
+    @app_commands.check(only_admin)
+    async def manga(interaction: discord.Interaction, titel: Optional[str] = None, auswahl: Optional[str] = None) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not (titel or "").strip():
+            items = await asyncio.to_thread(bot.manga.items)
+            view = MangaList(bot, interaction.user, items)
+            view.message = await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True, wait=True)
+            return
+        releases = await asyncio.to_thread(bot.manga.search, titel)
+        if not releases:
+            await interaction.followup.send(f"🔎 Nichts gefunden für **{escape(titel.strip())}**. Den englischen Titel "
+                                            "versuchen, oder ohne Untertitel.", ephemeral=True)
+            return
+        view = MangaSearch(bot, interaction.user, titel.strip(), releases, auswahl)
+        view.message = await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True, wait=True)
+
+    return [manga] if bot.manga is not None else []
+
+
 def build_commands(bot: SeerrBot) -> list[app_commands.Command]:
     def requester(interaction: discord.Interaction) -> bool:
         if bot.may_request(interaction):
@@ -2106,6 +2488,7 @@ def build_commands(bot: SeerrBot) -> list[app_commands.Command]:
     if bot.jellyfin is not None:
         commands += friend_commands(bot, requester)
     commands += extra_commands(bot, requester)
+    commands += manga_commands(bot)
     return commands + [hilfe]
 
 
