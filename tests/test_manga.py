@@ -76,6 +76,15 @@ class PartsTest(unittest.TestCase):
         self.assertEqual([p.label for p in parts], ["Band 1", "Band 2", "Kapitel 187", "Kapitel 188"])
         self.assertEqual(selection_label(parts), "Band 1–2 und Kapitel 187–188")
 
+    def test_several_series_in_one_pack(self):
+        files = [(f"Tokyo Ghoul - re (digital)/Tokyo Ghoul - re v{n:02d} (2019).cbz", 1) for n in (1, 2)] + \
+                [(f"Tokyo Ghoul (digital)/Tokyo Ghoul v{n:02d} (2015).cbz", 1) for n in (1, 2, 3)]
+        parts = parts_from_files(files)
+        self.assertEqual([p.label for p in parts], ["Tokyo Ghoul: Band 1", "Tokyo Ghoul: Band 2", "Tokyo Ghoul: Band 3",
+                                                    "Tokyo Ghoul - re: Band 1", "Tokyo Ghoul - re: Band 2"])
+        self.assertEqual(selection_label(parts), "Tokyo Ghoul: Band 1–3; Tokyo Ghoul - re: Band 1–2")
+        self.assertEqual(selection_label(parts[3:4]), "Tokyo Ghoul - re: Band 1")
+
     def test_image_folders_are_one_part_each(self):
         files = [(f"Manga/Chapter {c}/{i:03d}.jpg", 100) for c in (1, 2) for i in range(5)] + [("Manga/cover.jpg", 50)]
         parts = parts_from_files(files)

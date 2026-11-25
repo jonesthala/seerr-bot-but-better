@@ -137,6 +137,7 @@ class Part:
     label: str
     paths: tuple[str, ...]  # paths inside the torrent
     size: int
+    group: str = ""  # a pack with several series in their own folders: the series, also in front of the label
 
 
 def _number(text: str) -> float:
@@ -176,10 +177,16 @@ def parts_from_files(files: list[tuple[str, int]] | tuple[tuple[str, int], ...])
     """What can be picked from a torrent: comic files one by one, folders of images as a whole, nothing else.
     If there are neither, every file on its own."""
     comics = [(p, s) for p, s in files if p.lower().endswith(COMIC_EXTENSIONS)]
+    parents = {p.rsplit("/", 1)[0] if "/" in p else "" for p, _ in comics}
     parts: list[Part] = []
     for path, size in comics:
         kind, number, last = classify(path)
-        parts.append(Part(kind, number, last, _label(kind, number, last, path), (path,), size))
+        label = _label(kind, number, last, path)
+        group = ""
+        if len(parents) > 1:  # e.g. 'Tokyo Ghoul (digital)/…' and 'Tokyo Ghoul - re (digital)/…' in one pack
+            group = short_name(path.rsplit("/", 1)[0].rsplit("/", 1)[-1]) if "/" in path else "Sonstiges"
+            label = f"{group}: {label}"
+        parts.append(Part(kind, number, last, label, (path,), size, group))
     folders: dict[str, list[tuple[str, int]]] = {}
     for path, size in files:
         if path.lower().endswith(IMAGE_EXTENSIONS) and "/" in path:
@@ -194,7 +201,8 @@ def parts_from_files(files: list[tuple[str, int]] | tuple[tuple[str, int], ...])
             parts.append(Part(kind, number, last, label, tuple(p for p, _ in inside), sum(s for _, s in inside)))
     if not parts:
         parts = [Part("datei", None, None, p.rsplit("/", 1)[-1], (p,), s) for p, s in files]
-    parts.sort(key=lambda p: (KINDS.index(p.kind), p.number if p.number is not None else 0, p.paths[0].casefold()))
+    parts.sort(key=lambda p: (p.group.casefold(), KINDS.index(p.kind), p.number if p.number is not None else 0,
+                              p.paths[0].casefold()))
     return parts[:MAX_PARTS]
 
 
@@ -215,9 +223,20 @@ def _ranges(numbers: list[float]) -> str:
 
 
 def selection_label(parts: list[Part]) -> str:
-    """'Band 10–14' or 'Band 1–3, Kapitel 187–190 und 2 weitere Dateien' for the chosen parts."""
+    """'Band 10–14' or 'Band 1–3, Kapitel 187–190 und 2 weitere Dateien' for the chosen parts; with several series
+    in one pack 'Tokyo Ghoul: Band 1–14; Tokyo Ghoul - re: Band 1–3'."""
     if not parts:
         return "nichts"
+    groups: dict[str, list[Part]] = {}
+    for p in parts:
+        groups.setdefault(p.group, []).append(p)
+    if len(groups) > 1 or next(iter(groups)):
+        return "; ".join(f"{group}: {_group_label(members)}" if group else _group_label(members)
+                         for group, members in groups.items())
+    return _group_label(parts)
+
+
+def _group_label(parts: list[Part]) -> str:
     pieces = []
     for kind, word in (("band", "Band"), ("kapitel", "Kapitel")):
         numbers: list[float] = []
@@ -231,7 +250,8 @@ def selection_label(parts: list[Part]) -> str:
     others = [p for p in parts if p.kind in ("ordner", "datei") or p.number is None]
     if others:
         if len(others) == 1 and not pieces:
-            pieces.append(others[0].label)
+            only = others[0]
+            pieces.append(only.label[len(only.group) + 2:] if only.group else only.label)
         else:
             what = "Ordner" if all(p.kind == "ordner" for p in others) else ("Datei" if len(others) == 1 else "Dateien")
             pieces.append(f"{len(others)} {'weitere ' if pieces else ''}{what}")
