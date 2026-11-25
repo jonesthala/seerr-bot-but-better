@@ -348,6 +348,9 @@ details.more summary:hover { color: var(--text); }
   .dl { grid-template-columns: 80px 1fr auto; }
 }
 @media (max-width: 600px) {
+  .manga-item { grid-template-columns: minmax(0, 1fr); }
+  .manga-item .torrent-progress { grid-row: auto; grid-column: auto; }
+  .manga-parts { max-height: none; overflow: visible; }
   .episode { grid-template-columns: 22px minmax(0, 1fr); row-gap: 1px; }
   .episode .state { grid-column: 2; white-space: normal; }
   .btn { white-space: normal; text-align: center; }

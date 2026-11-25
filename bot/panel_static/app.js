@@ -902,7 +902,7 @@
     const info = [m.done ? "fertig" : `${m.percent.toFixed(m.percent >= 100 ? 0 : 1)} %`];
     if (!m.done && m.speed) info.push(speed(m.speed));
     if (!m.done && m.eta) info.push(etaText(m.eta));
-    return h("div", { class: "torrent" },
+    return h("div", { class: "torrent manga-item" },
       h("div", null, h("div", { class: "torrent-name" }, m.short),
         h("div", { class: "item-meta" }, h("span", { class: `pill ${color}` }, label), h("span", null, m.chosen), h("span", null, size(m.size)),
           m.count < m.total ? h("span", null, `im Paket: ${m.all}`) : null)),
@@ -1028,7 +1028,8 @@
       if (data.free !== null) {
         const afterLoad = data.free - total;
         tooBig = chosen.size > 0 && afterLoad < data.min_free;
-        const line = h("div", { class: tooBig ? "" : "muted" }, `Frei ${size(data.free)}${chosen.size ? `, danach ${size(Math.max(afterLoad, 0))}` : ""}${tooBig ? `: zu wenig, unter ${size(data.min_free)} lädt der Bot nichts` : ""}`);
+        const exact = (bytes) => `${(Math.max(bytes, 0) / GB).toFixed(1)} GB`; // "11 GB, danach 11 GB" says nothing
+        const line = h("div", { class: tooBig ? "" : "muted" }, `Frei ${exact(data.free)}${chosen.size ? `, danach ${exact(afterLoad)}` : ""}${tooBig ? `: zu wenig, unter ${size(data.min_free)} lädt der Bot nichts` : ""}`);
         if (tooBig) line.style.color = "var(--red)";
         parts.push(line);
       }
