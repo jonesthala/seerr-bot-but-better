@@ -21,7 +21,7 @@ from aiohttp import ClientError, ClientSession, ClientTimeout, web
 
 from .arr import ArrError
 from .core import GB, REQUEST_PENDING, SeerrError, Title, declined_text, size_text
-from .discord_bot import approved_text, escape, login_view
+from .discord_bot import approved_text, decide_friend_request, escape, login_view
 from .extras import BRAKE_MARGIN, first_season_to_pick, parse_start, per_episode_estimate, plan_episodes, plan_lines
 from .jellyfin import JellyfinError
 from .manga import MangaError, Release, overview_label, part_rows, short_name
@@ -47,7 +47,7 @@ from .panel import (
     torrent_data,
     watched_data,
 )
-from .store import FRIEND_APPROVED, FRIEND_DECLINED, FRIEND_PENDING, Follow
+from .store import FRIEND_APPROVED, FRIEND_PENDING, Follow
 
 if TYPE_CHECKING:
     from .discord_bot import SeerrBot
@@ -451,22 +451,17 @@ class Panel:
         if bot.jellyfin is None:
             raise PanelError("Jellyfin-Zugänge sind nicht eingerichtet.")
         data = await _body(request)
-        user_id, action = _whole(data, "id"), _choice(data, "action", ("approve", "decline"))
-        who = escape(request["user"])
-        async with bot._friend_lock:
-            friend = bot.store.friend(user_id)
-            if friend is None or friend.state != FRIEND_PENDING:
-                raise PanelError("Diese Anfrage ist schon erledigt.")
-            if action == "approve":
-                if friend.jellyfin_id:
-                    await asyncio.to_thread(bot.jellyfin.set_access, friend.jellyfin_id, True)
-                else:
-                    friend.jellyfin_id = await asyncio.to_thread(bot.jellyfin.create_friend, friend.jellyfin_name)
-                friend.state, note = FRIEND_APPROVED, f"✅ Freigegeben von {who} ({PANEL})."
-            else:
-                friend.state, note = FRIEND_DECLINED, f"❌ Abgelehnt von {who} ({PANEL})."
-            friend.decided = time.time()
-            bot.store.save_friend(friend)
+        user_id = data.get("id")
+        if type(user_id) is not int:  # negative: a friend from the web form
+            raise PanelError("Die Anfrage ist ungültig.")
+        action = _choice(data, "action", ("approve", "decline"))
+        friend, note = await decide_friend_request(bot, user_id, action, f"{escape(request['user'])} ({PANEL})")
+        if friend is None:
+            raise PanelError("Diese Anfrage ist schon erledigt.")
+        if friend.from_web:
+            await self._edit(friend.channel_id, friend.message_id, f"{friend.card_text}\n{note} Die Mail geht gleich raus.")
+            return web.json_response({"message": f"{'Freigegeben' if action == 'approve' else 'Abgelehnt'}: "
+                                                 f"{friend.user_name} bekommt gleich eine Mail."})
         await self._edit(friend.channel_id, friend.message_id, f"{friend.card_text}\n{note}")
         if friend.state == FRIEND_APPROVED:
             await self._tell(user_id, approved_text(friend.jellyfin_name), login_view(user_id))

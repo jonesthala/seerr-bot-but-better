@@ -661,7 +661,7 @@ HELP = {  # command → (who, example)
     "hilfe": (EVERYONE, "/hilfe"),
     "löschen": (ADMINS, "/löschen Sintel"),
     "jellyfin-liste": (ADMINS, "/jellyfin-liste"),
-    "jellyfin-entziehen": (ADMINS, "/jellyfin-entziehen @person"),
+    "jellyfin-entziehen": (ADMINS, "/jellyfin-entziehen @person (oder benutzer: name)"),
     "speicher": (ADMINS, "/speicher"),
     "folgen": (ADMINS, "/folgen Dexter"),
     "manga": (ADMINS, "/manga Tokyo Ghoul"),

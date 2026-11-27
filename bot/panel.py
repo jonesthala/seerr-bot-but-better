@@ -304,7 +304,7 @@ def follow_request_data(f: Follow) -> dict[str, Any]:
 
 def friend_data(f: Friend) -> dict[str, Any]:
     return {"id": f.user_id, "user": f.user_name, "jellyfin_name": f.jellyfin_name, "created": f.created,
-            "existing": bool(f.jellyfin_id)}
+            "existing": bool(f.jellyfin_id), "web": f.from_web, "renew": f.renew}
 
 
 def follow_data(f: Follow, upcoming: dict | None, zone: Any) -> dict[str, Any]:

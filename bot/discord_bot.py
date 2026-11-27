@@ -103,6 +103,8 @@ from .extras import (
 from .manga import MangaError, MangaService, Release, overview_label, parse_selection, part_rows, selection_label, short_name
 from .manga import Part as MangaPart
 from .kavita import GIVE_UP_SECONDS, SCAN_WAIT, ReaderSync, series_link
+from .signup import WEB_ICON, SignupClient, SignupError, WebRequest, arrival, free_name, plain, wished_name
+from .signup import card_text as web_card_text
 from .torrents import QbitClient, TorrentCleaner, TorrentError
 from .store import (FRIEND_APPROVED, FRIEND_DECLINED, FRIEND_PENDING, FRIEND_REVOKED, Approval, Friend, Store,
                     Follow, WatchQuestion)
@@ -216,7 +218,8 @@ class SeerrBot(discord.Client):
     def __init__(self, settings: Settings, seerr: SeerrClient, store: Store | None = None,
                  jellyfin: JellyfinClient | None = None, torrents: TorrentCleaner | None = None,
                  arrs: dict[str, ArrClient] | None = None, qbit: QbitClient | None = None,
-                 manga: MangaService | None = None, reader: ReaderSync | None = None) -> None:
+                 manga: MangaService | None = None, reader: ReaderSync | None = None,
+                 signup: SignupClient | None = None) -> None:
         intents = discord.Intents.none()
         intents.guilds = True
         # Only the requester may be pinged, never @everyone or roles (titles come from TMDB).
@@ -231,6 +234,8 @@ class SeerrBot(discord.Client):
         self.manga = manga  # None: no /manga (needs Prowlarr and qBittorrent)
         # tells when a manga is loaded; with Kavita set up only once Kavita has scanned it
         self.reader = reader if reader is not None or manga is None else ReaderSync(manga, None)
+        self.signup = signup  # None: no web form for friends without Discord
+        self._signup_lock = asyncio.Lock()
         self.store = store if store is not None else Store(settings.data_dir or None)
         self.tree = GuardedTree(self)
         self.space = SpaceWatch(settings.min_free_gb * GB)
@@ -363,7 +368,8 @@ class SeerrBot(discord.Client):
     @tasks.loop(minutes=WATCH_MINUTES)
     async def watch_loop(self) -> None:
         for check, what in ((self.sync_approvals, "Approval"), (self.check_requests, "Request"),
-                            (self.load_profiles, "Profile"), (self.check_manga, "Manga")):
+                            (self.load_profiles, "Profile"), (self.check_manga, "Manga"),
+                            (self.check_signups, "Signup")):
             try:
                 await check()
             except Exception:  # noqa: BLE001 - the loop must keep running
@@ -583,6 +589,99 @@ class SeerrBot(discord.Client):
             await self.tell(int(wish["user_id"]), text)
         except discord.HTTPException:
             log.warning("Could not tell %s about the finished manga", wish["user_id"])
+
+    async def check_signups(self) -> None:
+        """The web form: mails still to send go out first, then new requests get an approval card."""
+        if self.signup is None or self.jellyfin is None:
+            return
+        await self.send_signup_mails()
+        for request in await asyncio.to_thread(self.signup.pending):
+            try:
+                await self.take_signup(request)
+            except (SignupError, JellyfinError) as exc:
+                log.warning("Web request could not be taken: %s", exc)
+
+    async def take_signup(self, request: WebRequest) -> None:
+        if self.store.friend_by_web_id(request.id) is not None:
+            return  # its card is out already, or its mail is waiting
+        existing = self.store.friend_by_email(request.email)
+        what = arrival(existing, time.time())
+        if what == "drop":
+            await asyncio.to_thread(self.signup.decline, request.id, False)
+            return
+        if what == "replace" and existing is not None:
+            existing.web_id = request.id  # waits already: answer the newer request
+            self.store.save_friend(existing)
+            return
+        taken_in_jellyfin = set()
+        if what == "new":
+            taken_in_jellyfin = {str(u.get("Name", "")).casefold() for u in await asyncio.to_thread(self.jellyfin.users)}
+        async with self._friend_lock:
+            friend = existing or Friend(user_id=self.store.next_web_id(), user_name="", jellyfin_name="", created=0.0,
+                                        email=request.email)
+            if what == "new":
+                friend.jellyfin_name = free_name(wished_name(request), lambda n: n.casefold() in taken_in_jellyfin
+                                                 or self.store.name_taken(n, friend.user_id))
+            friend.user_name, friend.created = plain(request.name), time.time()
+            friend.renew = what == "renew"
+            friend.state = FRIEND_PENDING
+            friend.web_id, friend.web_reply, friend.web_warned = request.id, "", False
+            friend.card_text = web_card_text(friend)
+            message = await self.post(friend.card_text, view=friend_view(friend.user_id),
+                                      channel_id=self.settings.approvals_channel)
+            friend.channel_id, friend.message_id = message.channel.id, message.id
+            self.store.save_friend(friend)
+
+    def kick_signup_mails(self) -> None:
+        """After a decision on a web request: send its mail now instead of at the next check."""
+        if self.signup is not None:
+            self.in_background(self.send_signup_mails())
+
+    async def send_signup_mails(self) -> None:
+        """Sends what web friends still wait for. What fails is tried again on the next check; admins hear of it once."""
+        if self.signup is None or self.jellyfin is None:
+            return
+        async with self._signup_lock:
+            for friend in self.store.web_outbox():
+                name = escape(friend.user_name)
+                try:
+                    if friend.web_reply == "decline":
+                        await asyncio.to_thread(self.signup.decline, friend.web_id, True)
+                        note = f"📧 {WEB_ICON} Die Absage an **{name}** ist verschickt."
+                    else:
+                        password = await asyncio.to_thread(self.jellyfin.reset_password, friend.jellyfin_id)
+                        await asyncio.to_thread(self.signup.approve, friend.web_id, friend.jellyfin_name, password,
+                                                self.settings.jellyfin_friend_url, self.settings.tailscale_share_url,
+                                                friend.web_reply == "welcome")
+                        note = (f"📧 {WEB_ICON} **{name}** hat die Mail mit Anleitung und Passwort-Link für "
+                                f"**{escape(friend.jellyfin_name)}** bekommen.")
+                except SignupError as exc:
+                    if exc.status != 404:
+                        await self._signup_trouble(friend, str(exc))
+                        continue
+                    note = (f"⚠️ {WEB_ICON} Die Anfrage von **{name}** gibt es auf der Webseite nicht mehr, darum "
+                            "ging keine Mail raus. Die Person kann das Formular nochmals ausfüllen.")
+                except JellyfinError as exc:
+                    await self._signup_trouble(friend, str(exc))
+                    continue
+                friend.web_id, friend.web_reply, friend.web_warned = "", "", False
+                self.store.save_friend(friend)
+                try:
+                    await self.post(note, channel_id=self.settings.approvals_channel)
+                except discord.HTTPException:
+                    log.warning("Could not post the mail note")
+
+    async def _signup_trouble(self, friend: Friend, reason: str) -> None:
+        log.warning("Mail for web request %s not sent yet: %s", friend.user_id, reason)
+        if friend.web_warned:
+            return
+        friend.web_warned = True
+        self.store.save_friend(friend)
+        try:
+            await self.post(f"⚠️ {WEB_ICON} Die Mail an **{escape(friend.user_name)}** ging nicht raus: {reason} "
+                            "Der Bot versucht es alle 2 Minuten wieder.", channel_id=self.settings.approvals_channel)
+        except discord.HTTPException:
+            log.warning("Could not post the mail warning")
 
     async def check_brake(self) -> None:
         """Pauses the running downloads when the disk is nearly full, starts them again once there is room."""
@@ -1231,7 +1330,8 @@ def approved_text(name: str) -> str:
             "«Zugangsdaten anzeigen»: Du bekommst die Anleitung und ein Passwort, das nur du siehst.")
 
 
-class FriendButton(discord.ui.DynamicItem[discord.ui.Button], template=r"jf:(?P<action>approve|decline):(?P<id>[0-9]+)"):
+class FriendButton(discord.ui.DynamicItem[discord.ui.Button],
+                   template=r"jf:(?P<action>approve|decline):(?P<id>-?[0-9]+)"):  # negative: from the web form
     def __init__(self, user_id: int, action: str) -> None:
         approve = action == "approve"
         super().__init__(discord.ui.Button(
@@ -1284,6 +1384,34 @@ def login_view(user_id: int) -> discord.ui.View:
     return view
 
 
+async def decide_friend_request(bot: SeerrBot, user_id: int, action: str, who: str) -> tuple[Friend | None, str]:
+    """Approves or declines a waiting Jellyfin request (Discord or web form), from Discord or the panel.
+    Returns the friend and the note for the card, or (None, "") if it was decided already. Web friends get their
+    mail from the outbox; Discord friends have to be told by the caller."""
+    async with bot._friend_lock:
+        friend = bot.store.friend(user_id)
+        if friend is None or friend.state != FRIEND_PENDING:
+            return None, ""
+        if action == "approve":
+            if friend.jellyfin_id:
+                await asyncio.to_thread(bot.jellyfin.set_access, friend.jellyfin_id, True)
+            else:
+                friend.jellyfin_id = await asyncio.to_thread(bot.jellyfin.create_friend, friend.jellyfin_name)
+            friend.state, note = FRIEND_APPROVED, f"✅ Freigegeben von {who}."
+            friend.web_reply = ("again" if friend.renew else "welcome") if friend.from_web else ""
+        else:
+            # Somebody who has access and only asked for new login data keeps the access.
+            friend.state = FRIEND_APPROVED if friend.renew else FRIEND_DECLINED
+            note = f"❌ Abgelehnt von {who}." + (" Der bestehende Zugang bleibt." if friend.renew else "")
+            friend.web_reply = "decline" if friend.from_web else ""
+        friend.renew, friend.web_warned = False, False
+        friend.decided = time.time()
+        bot.store.save_friend(friend)
+    if friend.from_web:
+        bot.kick_signup_mails()
+    return friend, note
+
+
 async def handle_friend_decision(interaction: discord.Interaction, user_id: int, action: str) -> None:
     bot: SeerrBot = interaction.client  # type: ignore[assignment]
     if not bot.is_admin(interaction):
@@ -1292,24 +1420,16 @@ async def handle_friend_decision(interaction: discord.Interaction, user_id: int,
     if bot.jellyfin is None:
         raise JellyfinError("Jellyfin-Zugänge sind nicht eingerichtet.")
     await interaction.response.defer()
-    async with bot._friend_lock:
-        friend = bot.store.friend(user_id)
-        if friend is None or friend.state != FRIEND_PENDING:
-            text = interaction.message.content if interaction.message else ""
-            await interaction.edit_original_response(content=f"{text}\nℹ️ Schon erledigt.", view=None)
-            return
-        who = escape(interaction.user.display_name)
-        if action == "approve":
-            if friend.jellyfin_id:
-                await asyncio.to_thread(bot.jellyfin.set_access, friend.jellyfin_id, True)
-            else:
-                friend.jellyfin_id = await asyncio.to_thread(bot.jellyfin.create_friend, friend.jellyfin_name)
-            friend.state, note = FRIEND_APPROVED, f"✅ Freigegeben von {who}."
-        else:
-            friend.state, note = FRIEND_DECLINED, f"❌ Abgelehnt von {who}."
-        friend.decided = time.time()
-        bot.store.save_friend(friend)
+    friend, note = await decide_friend_request(bot, user_id, action, escape(interaction.user.display_name))
+    if friend is None:
+        text = interaction.message.content if interaction.message else ""
+        await interaction.edit_original_response(content=f"{text}\nℹ️ Schon erledigt.", view=None)
+        return
+    if friend.from_web:
+        note += " Die Mail geht gleich raus."
     await interaction.edit_original_response(content=f"{friend.card_text}\n{note}", view=None)
+    if friend.from_web:
+        return
     if friend.state == FRIEND_APPROVED:
         await bot.tell(user_id, approved_text(friend.jellyfin_name), login_view(user_id))
     else:
@@ -2578,12 +2698,19 @@ def friend_commands(bot: SeerrBot, requester) -> list[app_commands.Command]:
             await interaction.response.send_modal(AccessForm(bot, suggest_name(interaction.user.display_name)))
 
     @app_commands.command(name="jellyfin-entziehen", description="Den Zugang einer Person zu Jellyfin sperren (nur Admins)")
-    @app_commands.describe(person="Wer keinen Zugang mehr haben soll")
+    @app_commands.describe(person="Wer keinen Zugang mehr haben soll (Discord)",
+                           benutzer="Oder der Jellyfin-Benutzername, z.B. für Freunde von der Webseite")
     @app_commands.check(friend_admin)
-    async def jellyfin_entziehen(interaction: discord.Interaction, person: discord.User) -> None:
-        friend = bot.store.friend(person.id)
+    async def jellyfin_entziehen(interaction: discord.Interaction, person: Optional[discord.User] = None,
+                                 benutzer: Optional[str] = None) -> None:
+        if person is None and not benutzer:
+            await interaction.response.send_message("ℹ️ Gib eine Person oder einen Jellyfin-Benutzernamen an.",
+                                                    ephemeral=True)
+            return
+        friend = bot.store.friend(person.id) if person is not None else bot.store.friend_by_name(benutzer or "")
         if friend is None or friend.state != FRIEND_APPROVED:
-            await interaction.response.send_message(f"ℹ️ {escape(person.display_name)} hat keinen aktiven Zugang.",
+            who = person.display_name if person is not None else benutzer
+            await interaction.response.send_message(f"ℹ️ {escape(str(who))} hat keinen aktiven Zugang.",
                                                     ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -2603,11 +2730,11 @@ def friend_commands(bot: SeerrBot, requester) -> list[app_commands.Command]:
         lines = []
         for friend in bot.store.all_friends():
             when = datetime.fromtimestamp(friend.decided or friend.created, bot.settings.zone).strftime("%d.%m.%Y")
-            lines.append(f"{icons.get(friend.state, '•')} <@{friend.user_id}> · **{escape(friend.jellyfin_name)}**"
-                         f" · {when}")
+            who = f"{WEB_ICON} {escape(friend.user_name)}" if friend.from_web else f"<@{friend.user_id}>"
+            lines.append(f"{icons.get(friend.state, '•')} {who} · **{escape(friend.jellyfin_name)}** · {when}")
         embed = discord.Embed(title="Zugang zu Jellyfin", color=discord.Color.blurple(),
                               description="\n".join(lines)[:4000] or "Noch niemand hat angefragt.")
-        embed.set_footer(text="✅ hat Zugang · ⏳ wartet · ❌ abgelehnt · 🚫 gesperrt")
+        embed.set_footer(text=f"✅ hat Zugang · ⏳ wartet · ❌ abgelehnt · 🚫 gesperrt · {WEB_ICON} über die Webseite")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="speicher", description="Was am meisten Platz braucht und ob es jemand geschaut hat (nur Admins)")

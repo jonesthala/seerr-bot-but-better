@@ -528,7 +528,9 @@
           yes.onclick = act("/api/inbox/friend", f.id, "approve", yes);
           no.onclick = act("/api/inbox/friend", f.id, "decline", no);
           return h("div", { class: "item simple" }, h("div", { class: "item-body" },
-            h("div", { class: "item-title" }, h("h3", null, f.user), h("span", { class: "pill" }, f.existing ? "wieder freischalten" : "neuer Zugang")),
+            h("div", { class: "item-title" }, h("h3", null, f.user),
+              h("span", { class: "pill" }, f.renew ? "neue Zugangsdaten" : f.existing ? "wieder freischalten" : "neuer Zugang"),
+              f.web ? h("span", { class: "pill" }, "über die Webseite, Antwort per Mail") : null),
             h("div", { class: "item-meta" }, h("span", null, `Benutzername in Jellyfin: ${f.jellyfin_name}`), f.created ? h("span", null, ago(f.created)) : null),
             h("div", { class: "item-actions" }, yes, no)));
         }))));

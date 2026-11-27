@@ -114,7 +114,10 @@ disk from running full.
   *Zugangsdaten anzeigen* button, by DM or in the channel.
 - The button shows the whole guide, the Tailscale share link and a **fresh password that only this person
   sees**. Passwords are never stored; a new click makes a new one, so it also works as "forgot password".
-- **`/jellyfin-liste`** and **`/jellyfin-entziehen <person>`** (admins only): who has access, and block an account.
+- **`/jellyfin-liste`** and **`/jellyfin-entziehen <person>`** (admins only): who has access, and block an account
+  (`benutzer:` takes a Jellyfin user name instead, e.g. for friends from the web form).
+- Optional **web form for friends without Discord** (see [setup](#8-web-form-for-friends-without-discord-optional)):
+  same approval cards, the guide comes by mail with a one-time link to the password.
 - **`/speicher`** (admins only): the ten titles that take the most space, how many files, when anyone last
   watched them and who requested them, plus free space. Helps to decide what `/löschen` should remove.
 
@@ -300,6 +303,20 @@ the same pack, or delete one with its files. When a download is complete, the bo
 Free space counts like for requests: below `MIN_FREE_GB` after the download, nothing is loaded, and the download
 brake pauses mangas too.
 
+### 8. Web form for friends without Discord (optional)
+
+[jellyfin-zugang](https://github.com/jonesthala/jellyfin-zugang) is a small site (e.g. on Vercel) where friends
+ask for access with name, e-mail and an invite code. The bot **fetches** open requests every two minutes, so the
+homelab doesn't have to be reachable from the internet. Each request gets the same approval card as
+`/jellyfin-zugang` (in Discord and in the panel), marked 🌐 with a masked e-mail. On *Freigeben* the bot creates
+the account and the site mails the guide with a one-time link to the password; on *Ablehnen* a short no. If the
+mail can't go out, admins hear about it once and the bot keeps trying.
+
+- Needs the Jellyfin setup above (step 4).
+- `SIGNUP_URL` (the site, `https://`) and `SIGNUP_TOKEN` (its `BOT_TOKEN`, at least 32 characters).
+- The same e-mail asking again while having access means "new login data": approving mails a new password,
+  declining keeps the access. After a no, new requests from that address are dropped quietly for a week.
+
 ## Settings
 
 | Variable | Default | Meaning |
@@ -343,6 +360,7 @@ brake pauses mangas too.
 | `NYAA_URL` | `https://nyaa.si` | Where the torrent files of manga packs come from |
 | `KAVITA_URL`, `KAVITA_API_KEY` | empty | Kavita scans a finished manga right away; the DM waits until Kavita has it |
 | `KAVITA_LIBRARY_DIR` | `/manga` | The manga category's folder as Kavita sees it |
+| `SIGNUP_URL`, `SIGNUP_TOKEN` | empty | Web form for friends without Discord: the site and its `BOT_TOKEN` |
 
 ## Security
 

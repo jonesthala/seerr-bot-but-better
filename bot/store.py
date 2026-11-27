@@ -53,8 +53,8 @@ FRIEND_PENDING, FRIEND_APPROVED, FRIEND_DECLINED, FRIEND_REVOKED = "pending", "a
 
 @dataclass
 class Friend:
-    user_id: int  # Discord
-    user_name: str  # Discord display name when asking
+    user_id: int  # Discord; negative for friends from the web form, who have no Discord account
+    user_name: str  # Discord display name when asking, or the name from the web form
     jellyfin_name: str
     created: float
     state: str = FRIEND_PENDING
@@ -63,6 +63,16 @@ class Friend:
     message_id: int = 0
     card_text: str = ""
     decided: float = 0.0
+    # web form only (see signup.py):
+    email: str = ""
+    web_id: str = ""  # the open request on the form's site, until its mail went out
+    web_reply: str = ""  # mail still to send: "welcome" (new or reopened account), "again" (new login data), "decline"
+    web_warned: bool = False  # admins were told that the mail can't go out yet
+    renew: bool = False  # waits for approval but has access already: declining keeps it
+
+    @property
+    def from_web(self) -> bool:
+        return self.user_id < 0
 
 
 @dataclass
@@ -302,6 +312,25 @@ class Store:
     def save_friend(self, friend: Friend) -> None:
         self.friends[friend.user_id] = friend
         self.save()
+
+    def friend_by_email(self, email: str) -> Friend | None:
+        wanted = email.strip().lower()
+        return next((f for f in self.friends.values() if f.email and f.email == wanted), None)
+
+    def friend_by_name(self, name: str) -> Friend | None:
+        wanted = name.strip().casefold()
+        return next((f for f in self.friends.values() if f.jellyfin_name.casefold() == wanted), None)
+
+    def friend_by_web_id(self, web_id: str) -> Friend | None:
+        return next((f for f in self.friends.values() if web_id and f.web_id == web_id), None)
+
+    def next_web_id(self) -> int:
+        """A new negative id for a friend from the web form."""
+        return min([f.user_id for f in self.friends.values()] + [0]) - 1
+
+    def web_outbox(self) -> list[Friend]:
+        """Web friends whose mail (welcome, new login data or no) still has to go out."""
+        return [f for f in self.all_friends() if f.from_web and f.web_reply and f.web_id]
 
     def name_taken(self, name: str, user_id: int) -> bool:
         """Another person already asked for this Jellyfin name (case doesn't matter)."""

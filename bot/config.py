@@ -148,11 +148,18 @@ class Settings:
     kavita_url: str = ""
     kavita_api_key: str = ""  # auth key of a Kavita admin
     kavita_library_dir: str = "/manga"  # the manga category's folder as Kavita sees it
+    # optional: the web form for friends without Discord (github.com/jonesthala/jellyfin-zugang)
+    signup_url: str = ""
+    signup_token: str = ""  # the form site's BOT_TOKEN
 
     @property
     def manga_enabled(self) -> bool:
         return bool(self.prowlarr_url and self.prowlarr_api_key and self.qbittorrent_url and self.qbittorrent_username
                     and self.qbittorrent_password)
+
+    @property
+    def signup_enabled(self) -> bool:
+        return self.friends_enabled and bool(self.signup_url and self.signup_token)
 
     @property
     def kavita_enabled(self) -> bool:
@@ -251,6 +258,11 @@ class Settings:
         kavita_url, kavita_key = _url("KAVITA_URL"), _text("KAVITA_API_KEY")
         if kavita_url and not kavita_key:
             raise ConfigError("KAVITA_URL needs KAVITA_API_KEY (Kavita: your account's settings -> Auth Keys)")
+        signup_url, signup_token = _url("SIGNUP_URL"), _text("SIGNUP_TOKEN")
+        if signup_url and len(signup_token) < 32:
+            raise ConfigError("SIGNUP_URL needs SIGNUP_TOKEN: the form site's BOT_TOKEN, at least 32 characters")
+        if signup_url and not signup_url.startswith("https://") and "localhost" not in signup_url:
+            raise ConfigError("SIGNUP_URL must start with https:// (the token goes with every request)")
         kavita_dir = _text("KAVITA_LIBRARY_DIR", "/manga") or "/manga"
         if not kavita_dir.startswith("/") or ".." in kavita_dir.split("/"):
             raise ConfigError("KAVITA_LIBRARY_DIR must be the folder as Kavita sees it, like /manga")
@@ -308,6 +320,8 @@ class Settings:
             kavita_url=kavita_url,
             kavita_api_key=kavita_key,
             kavita_library_dir=kavita_dir.rstrip("/") or "/",
+            signup_url=signup_url,
+            signup_token=signup_token,
         )
 
     def page_url(self, kind: str, tmdb_id: int) -> str | None:

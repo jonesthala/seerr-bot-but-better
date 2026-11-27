@@ -10,6 +10,7 @@ from .jellyfin import JellyfinClient
 from .arr import ArrClient
 from .kavita import KavitaClient, ReaderSync
 from .manga import MangaService, MangaSource
+from .signup import SignupClient
 from .torrents import QbitClient, TorrentCleaner
 from .seerr import SeerrClient
 
@@ -43,8 +44,9 @@ def main() -> int:
                              settings.manga_category, settings.manga_dir, settings.manga_reader_url)
         kavita = KavitaClient(settings.kavita_url, settings.kavita_api_key) if settings.kavita_enabled else None
         reader = ReaderSync(manga, kavita, settings.kavita_library_dir)
+    signup = SignupClient(settings.signup_url, settings.signup_token) if settings.signup_enabled else None
     SeerrBot(settings, seerr, jellyfin=jellyfin, torrents=torrents, arrs=arrs, qbit=qbit, manga=manga,
-             reader=reader).run(settings.discord_token, log_handler=None)
+             reader=reader, signup=signup).run(settings.discord_token, log_handler=None)
     return 0
 
 
